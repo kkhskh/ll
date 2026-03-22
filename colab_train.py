@@ -465,7 +465,7 @@ def main():
 
     df_train, df_test = load_data(data_dir)
     feature_cols = [c for c in df_train.columns if c not in [ID_COL, TARGET_COL]]
-    num_feature_cols = [c for c in feature_cols if c not in CAT_COLS]
+    num_feature_cols = [c for c in feature_cols if c not in CAT_COLS and c != TIME_COL]
 
     # Cross-sectional normalize: z-score each feature within each date
     print("Cross-sectional normalizing features...")
