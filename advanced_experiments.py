@@ -1,38 +1,47 @@
 """
 Advanced experiments toward 0.3+ Pearson.
 
-Phases:
-  1. Per-feature raw correlation with target (find silver-bullet features)
-  2. Cross-sectional normalization within each di group
-  3. Fold-safe per-si historical mean target feature
-  4. Stronger CatBoost (2000 iter) + LightGBM ensemble
-  5. Save best submission to artifacts/
+Four controlled CatBoost ablations — same walk-forward splits, one variable at a time:
+  A  raw_features                            meta + anon only
+  B  raw_plus_si_history                     A + si history features
+  C  raw_plus_rank_plus_si_history           B + within-di percentile ranks (top-30 anon)
+  D  raw_plus_zscore_plus_rank_plus_si_history  C + z-score anon cols within di
+
+Rules:
+  - meta_cols (si, di, industry, sector, top*) are NEVER normalized or ranked
+  - si history is built BEFORE any anonymous transformation
+  - every fold's train di < valid di  (hard-asserted)
+  - LightGBM disabled until ablations are complete (RUN_LGBM = False)
 """
 from __future__ import annotations
 
 import gc
 import json
+import math
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
 
 warnings.filterwarnings("ignore")
 
 # ── constants ──────────────────────────────────────────────────────────────────
-TRAIN_PATH  = "train.csv"
-TEST_PATH   = "test.csv"
-OUTPUT_DIR  = Path("artifacts")
+TRAIN_PATH = "train.csv"
+TEST_PATH  = "test.csv"
+OUTPUT_DIR = Path("artifacts")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-ID_COL      = "id"
-TARGET_COL  = "target"
-TIME_COL    = "di"
-STOCK_COL   = "si"
-CAT_COLS    = ["si", "industry", "sector", "top2000", "top1000", "top500"]
-N_SPLITS    = 5
+ID_COL     = "id"
+TARGET_COL = "target"
+TIME_COL   = "di"
+STOCK_COL  = "si"
+
+META_COL_CANDIDATES = ["si", "di", "industry", "sector", "top2000", "top1000", "top500"]
+
+N_SPLITS   = 5
+SEED       = 42
+RUN_LGBM   = False   # disabled until CatBoost ablations are complete
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -43,199 +52,246 @@ def pearson(y_true, y_pred):
     return float(np.corrcoef(y, p)[0, 1])
 
 
-def contiguous_time_splits(time_series, n_splits=N_SPLITS):
-    unique_vals = np.sort(time_series.dropna().unique())
-    chunks = np.array_split(unique_vals, n_splits)
+# ── walk-forward splitter (same logic as baseline_experiments.py) ──────────────
+def walk_forward_time_splits(
+    time_series: pd.Series,
+    n_splits: int = N_SPLITS,
+    min_train_groups: int = 252,
+    embargo_groups: int = 5,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Expanding-window walk-forward splits on di.
+    - warmup  = max(min_train_groups, ceil(0.30 * U))
+    - remaining di split into n_splits contiguous validation chunks
+    - embargo: last embargo_groups di before valid_start removed from train
+    - each fold: train contains ONLY di strictly before valid_start (minus embargo)
+    - empty folds skipped; raises if fewer than 2 survive
+    """
+    unique_di = np.sort(time_series.dropna().unique())
+    U = len(unique_di)
+    warmup = max(min_train_groups, math.ceil(0.30 * U))
+    remaining = unique_di[warmup:]
+    if len(remaining) == 0:
+        raise ValueError("No di groups left after warmup. Lower min_train_groups.")
+
+    chunks = np.array_split(remaining, n_splits)
     idx = np.arange(len(time_series))
-    return [(idx[~time_series.isin(c).to_numpy()], idx[time_series.isin(c).to_numpy()])
-            for c in chunks]
+    tv  = time_series.to_numpy()
+
+    splits = []
+    for chunk in chunks:
+        if len(chunk) == 0:
+            continue
+        valid_start = chunk[0]
+        pre = unique_di[unique_di < valid_start]
+        if embargo_groups > 0 and len(pre) > embargo_groups:
+            allowed = pre[:-embargo_groups]
+        else:
+            allowed = np.array([], dtype=pre.dtype)
+        tr_idx = idx[np.isin(tv, allowed)]
+        va_idx = idx[np.isin(tv, chunk)]
+        if len(tr_idx) > 0 and len(va_idx) > 0:
+            splits.append((tr_idx, va_idx))
+
+    if len(splits) < 2:
+        raise ValueError("Fewer than 2 valid folds. Lower min_train_groups or embargo_groups.")
+    return splits
 
 
-# ── Phase 1: per-feature correlation ──────────────────────────────────────────
-def per_feature_correlation(df_train, feature_cols):
-    print("\n" + "="*60)
-    print("PHASE 1: Per-feature raw Pearson with target")
-    print("="*60)
+# ── feature-set helpers ────────────────────────────────────────────────────────
+def get_feature_sets(df):
+    """Strict feature categorisation. id and target are excluded from all sets."""
+    all_cols = set(df.columns)
+    meta_cols = [c for c in META_COL_CANDIDATES if c in all_cols]
+    anon_cols = sorted(c for c in all_cols if c.startswith("f_"))
+    anon_numeric_cols = [
+        c for c in anon_cols if pd.api.types.is_numeric_dtype(df[c])
+    ]
+    return meta_cols, anon_cols, anon_numeric_cols
+
+
+# ── per-feature Pearson (anonymous cols only, raw target) ──────────────────────
+def per_feature_correlation(df_train, anon_numeric_cols):
     y = df_train[TARGET_COL].to_numpy(np.float64)
     rows = []
-    for col in feature_cols:
-        vals = df_train[col]
-        valid = vals.notna()
-        if valid.sum() < 100:
-            rows.append({"feature": col, "corr": 0.0, "n_valid": int(valid.sum())})
+    for col in anon_numeric_cols:
+        x = df_train[col].to_numpy(np.float64)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 100:
+            rows.append({"feature": col, "corr": 0.0, "corr_signed": 0.0})
             continue
-        c = pearson(y[valid.to_numpy()], vals[valid].to_numpy())
-        rows.append({"feature": col, "corr": abs(c) if not np.isnan(c) else 0.0,
-                     "corr_signed": c if not np.isnan(c) else 0.0,
-                     "n_valid": int(valid.sum())})
-
-    df_corr = pd.DataFrame(rows).sort_values("corr", ascending=False)
-    df_corr.to_csv(OUTPUT_DIR / "feature_correlations.csv", index=False)
-
-    print(f"\nTop 30 features by |corr| with target:")
-    print(df_corr.head(30).to_string(index=False))
-    top_signal = df_corr[df_corr["corr"] > 0.05]["feature"].tolist()
-    print(f"\nFeatures with |corr| > 0.05: {len(top_signal)}")
-    print(f"Max single-feature corr: {df_corr['corr'].max():.6f}")
-    return df_corr
+        c = float(np.corrcoef(x[mask], y[mask])[0, 1])
+        c = 0.0 if not np.isfinite(c) else c
+        rows.append({"feature": col, "corr": abs(c), "corr_signed": c})
+    return pd.DataFrame(rows).sort_values("corr", ascending=False).reset_index(drop=True)
 
 
-# ── Phase 2: cross-sectional normalization ────────────────────────────────────
-def cross_sectional_normalize(df, feature_cols, group_col=TIME_COL):
+# ── forward-safe si history (built on RAW si BEFORE any anonymous transform) ───
+def add_forward_safe_si_history(df_train, df_test):
     """
-    Fast vectorized z-score within each date group.
-    Computes group stats once via groupby().transform() with numpy backend,
-    then does a single array subtract/divide — no per-column loops.
+    Row-level, forward-safe per-si features from the raw, unnormalized si column.
+
+    Train (each row i sees only rows j < i for the same si, ordered by di then id):
+      si_hist_count    number of prior rows for this si
+      si_hist_mean     mean of prior targets (global mean if count=0)
+      si_last_target   previous target for this si  (global mean if first)
+      si_hist_std      std of prior targets  (global std if count < 2)
+
+    Test: per-si summaries from FULL train.
+    Unseen si → count=0, mean/last/std = global train values.
     """
-    print(f"\nApplying cross-sectional z-score within {group_col} groups...")
+    global_mean = float(df_train[TARGET_COL].mean())
+    global_std  = float(df_train[TARGET_COL].std())
+
+    # Work on a 0-based copy so positional reindex is safe
+    df_tr = df_train.copy().reset_index(drop=True)
+
+    # Canonical ordering: (si, di, id)
+    sort_order = df_tr.sort_values([STOCK_COL, TIME_COL, ID_COL]).index
+    df_s = df_tr.loc[sort_order].copy()
+
+    grp_target = df_s.groupby(STOCK_COL, sort=False)[TARGET_COL]
+
+    # si_hist_count: 0 for first occurrence of each si
+    df_s["si_hist_count"] = df_s.groupby(STOCK_COL, sort=False).cumcount()
+
+    # si_hist_mean: cumulative sum EXCLUDING current row / count
+    cumsum_excl = grp_target.cumsum() - df_s[TARGET_COL]
+    cnt = df_s["si_hist_count"].replace(0, np.nan)
+    df_s["si_hist_mean"] = (cumsum_excl / cnt).fillna(global_mean)
+
+    # si_last_target: target of the previous row for the same si
+    df_s["si_last_target"] = grp_target.shift(1).fillna(global_mean)
+
+    # si_hist_std: expanding std of prior rows (NaN until count >= 2)
+    df_s["si_hist_std"] = grp_target.transform(
+        lambda x: x.shift(1).expanding(min_periods=2).std()
+    ).fillna(global_std)
+
+    # ── assertion: no train row's own target appears in its own history ────────
+    # Row with count=0 must have hist_mean == global_mean
+    first_occ = df_s[df_s["si_hist_count"] == 0]
+    assert (first_occ["si_hist_mean"] == global_mean).all(), \
+        "First-occurrence rows should carry global_mean, not their own target"
+
+    # Reindex back to original df_train 0-based order
+    hist_cols = ["si_hist_count", "si_hist_mean", "si_last_target", "si_hist_std"]
+    df_train_out = df_train.copy()
+    for col in hist_cols:
+        df_train_out[col] = df_s[col].reindex(range(len(df_tr))).values
+
+    # ── test: per-si summaries from full train ─────────────────────────────────
+    si_grp = df_train.groupby(STOCK_COL)
+    test_count = si_grp[TARGET_COL].count()
+    test_mean  = si_grp[TARGET_COL].mean()
+    test_last  = si_grp[TARGET_COL].last()
+    test_std   = si_grp[TARGET_COL].std()
+
+    df_test_out = df_test.copy()
+    df_test_out["si_hist_count"]  = df_test_out[STOCK_COL].map(test_count).fillna(0).astype(int)
+    df_test_out["si_hist_mean"]   = df_test_out[STOCK_COL].map(test_mean).fillna(global_mean)
+    df_test_out["si_last_target"] = df_test_out[STOCK_COL].map(test_last).fillna(global_mean)
+    df_test_out["si_hist_std"]    = df_test_out[STOCK_COL].map(test_std).fillna(global_std)
+
+    return df_train_out, df_test_out
+
+
+# ── cross-sectional z-score (anonymous numeric cols only) ─────────────────────
+def cross_sectional_zscore_anonymous(df, anon_numeric_cols, group_col=TIME_COL):
+    """
+    Z-score ONLY anonymous numeric cols within each di group.
+    Meta cols (si, di, industry, sector, top*) are left bit-for-bit unchanged.
+    Zero-std groups replaced with std=1.
+    """
     out = df.copy()
-    f_cols = [c for c in feature_cols if c in df.columns and c != group_col]
+    f_cols = [c for c in anon_numeric_cols if c in df.columns]
 
-    # compute group means/stds for all numeric feature cols at once
-    grp = out.groupby(group_col, sort=False)
-    means = grp[f_cols].transform("mean")
-    stds  = grp[f_cols].transform("std").fillna(1.0)
-    stds  = stds.replace(0, 1.0)
+    arr    = out[f_cols].to_numpy(np.float64)
+    groups = out[group_col].to_numpy()
+    result = arr.copy()
 
-    out[f_cols] = (out[f_cols] - means) / (stds + 1e-8)
-    print("Done.")
+    for g in np.unique(groups):
+        mask  = groups == g
+        sub   = arr[mask]
+        mu    = np.nanmean(sub, axis=0)
+        sigma = np.nanstd(sub, axis=0)
+        sigma[sigma == 0] = 1.0
+        result[mask] = (sub - mu) / (sigma + 1e-8)
+
+    out[f_cols] = result.astype(np.float32)
     return out
 
 
-def add_rank_features(df, feature_cols, group_col=TIME_COL, top_n=30):
+# ── percentile rank features (anonymous cols only) ────────────────────────────
+def add_rank_features(df, rank_source_cols, group_col=TIME_COL, suffix="_csrank"):
     """
-    Fast vectorized within-date percentile rank for the top_n features.
-    Uses a single groupby rank call per feature (rank is unavoidably per-column).
+    Add within-di percentile rank for each col in rank_source_cols.
+    NaN stays NaN. Meta cols are never touched.
     """
     out = df.copy()
-    rank_cols = [c for c in feature_cols[:top_n] if c in df.columns and c != group_col]
     grp = out.groupby(group_col, sort=False)
-    for col in rank_cols:
-        out[f"{col}_rank"] = grp[col].rank(pct=True, na_option="keep")
+    for col in rank_source_cols:
+        if col in out.columns:
+            out[f"{col}{suffix}"] = grp[col].rank(pct=True, na_option="keep")
     return out
-
-
-# ── Phase 3: fold-safe per-si historical mean ─────────────────────────────────
-def add_si_target_history(df_train, df_test, splits):
-    """
-    For each fold: compute mean(target) per si on TRAIN portion only.
-    This is fold-safe because we never see validation targets.
-    For test: use full train mean per si.
-    """
-    print("\nBuilding fold-safe per-si historical mean target feature...")
-    si_oof = np.zeros(len(df_train))
-    global_si_mean = df_train.groupby(STOCK_COL)[TARGET_COL].mean()
-
-    for tr_idx, va_idx in splits:
-        tr = df_train.iloc[tr_idx]
-        va = df_train.iloc[va_idx]
-        si_means = tr.groupby(STOCK_COL)[TARGET_COL].mean()
-        # fill val stocks not seen in train with global grand mean
-        si_oof[va_idx] = va[STOCK_COL].map(si_means).fillna(df_train[TARGET_COL].mean()).to_numpy()
-
-    df_train = df_train.copy()
-    df_test  = df_test.copy()
-    df_train["si_hist_mean"] = si_oof
-    df_test["si_hist_mean"]  = df_test[STOCK_COL].map(global_si_mean).fillna(df_train[TARGET_COL].mean()).to_numpy()
-    print("Done.")
-    return df_train, df_test
 
 
 # ── CatBoost CV ────────────────────────────────────────────────────────────────
-def run_catboost(df_train, df_test, feature_cols, splits, iterations=1500, tag="cb"):
+def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterations=1000):
     from catboost import CatBoostRegressor
 
-    cat_features = [c for c in CAT_COLS if c in feature_cols]
-    train_cb = df_train[feature_cols].copy()
-    test_cb  = df_test[feature_cols].copy()
+    # Only keep cols present in both dataframes
+    feat = [c for c in feature_cols if c in df_train.columns and c in df_test.columns]
+    cat_features = [c for c in meta_cols if c in feat]
+
+    tr_cb = df_train[feat].copy()
+    te_cb = df_test[feat].copy()
     for c in cat_features:
-        train_cb[c] = train_cb[c].astype(str)
-        test_cb[c]  = test_cb[c].astype(str)
+        tr_cb[c] = tr_cb[c].astype(str)
+        te_cb[c] = te_cb[c].astype(str)
 
     y = df_train[TARGET_COL].to_numpy(np.float64)
-    oof  = np.zeros(len(df_train))
+    oof       = np.zeros(len(df_train))
     test_pred = np.zeros(len(df_test))
+    fold_scores = []
 
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        # Hard assertion: no future di in train
+        tr_di = df_train.iloc[tr_idx][TIME_COL]
+        va_di = df_train.iloc[va_idx][TIME_COL]
+        assert tr_di.max() < va_di.min(), \
+            f"[{tag}] fold {fold_id}: train di max={tr_di.max()} >= valid di min={va_di.min()}"
+
         model = CatBoostRegressor(
             loss_function="RMSE",
             eval_metric="RMSE",
-            depth=7,
-            learning_rate=0.02,
+            depth=6,
+            learning_rate=0.05,
             iterations=iterations,
-            l2_leaf_reg=5.0,
-            random_seed=42 + fold_id,
+            l2_leaf_reg=3.0,
+            random_seed=SEED + fold_id,
             subsample=0.8,
             bootstrap_type="Bernoulli",
             od_type="Iter",
-            od_wait=150,
+            od_wait=100,
             verbose=False,
         )
         model.fit(
-            train_cb.iloc[tr_idx], y[tr_idx],
+            tr_cb.iloc[tr_idx], y[tr_idx],
             cat_features=cat_features if cat_features else None,
-            eval_set=(train_cb.iloc[va_idx], y[va_idx]),
+            eval_set=(tr_cb.iloc[va_idx], y[va_idx]),
             use_best_model=True,
         )
-        oof[va_idx]  = model.predict(train_cb.iloc[va_idx])
-        test_pred   += model.predict(test_cb) / len(splits)
-        fold_corr    = pearson(y[va_idx], oof[va_idx])
-        print(f"  [{tag}] fold {fold_id}: Pearson={fold_corr:.6f}  best_iter={model.best_iteration_}")
+        oof[va_idx]  = model.predict(tr_cb.iloc[va_idx])
+        test_pred   += model.predict(te_cb) / len(splits)
+        fc = pearson(y[va_idx], oof[va_idx])
+        fold_scores.append(fc)
+        print(f"  [{tag}] fold {fold_id}: Pearson={fc:.6f}  best_iter={model.best_iteration_}")
         del model; gc.collect()
 
-    oof_corr = pearson(y, oof)
-    print(f"  [{tag}] OOF Pearson: {oof_corr:.6f}")
-    return oof, test_pred, oof_corr
-
-
-# ── LightGBM CV ────────────────────────────────────────────────────────────────
-def run_lgbm(df_train, df_test, feature_cols, splits, tag="lgbm"):
-    import lightgbm as lgb
-
-    cat_features = [c for c in CAT_COLS if c in feature_cols]
-    train_f = df_train[feature_cols].copy()
-    test_f  = df_test[feature_cols].copy()
-    for c in cat_features:
-        train_f[c] = train_f[c].astype("category")
-        test_f[c]  = test_f[c].astype("category")
-
-    y = df_train[TARGET_COL].to_numpy(np.float64)
-    oof  = np.zeros(len(df_train))
-    test_pred = np.zeros(len(df_test))
-
-    params = dict(
-        objective="regression",
-        metric="rmse",
-        num_leaves=127,
-        learning_rate=0.02,
-        feature_fraction=0.7,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        min_child_samples=20,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        n_jobs=-1,
-        verbose=-1,
-        random_state=42,
-    )
-
-    for fold_id, (tr_idx, va_idx) in enumerate(splits):
-        ds_tr = lgb.Dataset(train_f.iloc[tr_idx], label=y[tr_idx],
-                            categorical_feature=cat_features if cat_features else "auto")
-        ds_va = lgb.Dataset(train_f.iloc[va_idx], label=y[va_idx], reference=ds_tr)
-        cb = lgb.log_evaluation(period=-1)
-        es = lgb.early_stopping(100, verbose=False)
-        model = lgb.train(params, ds_tr, num_boost_round=2000,
-                          valid_sets=[ds_va], callbacks=[cb, es])
-        oof[va_idx]  = model.predict(train_f.iloc[va_idx])
-        test_pred   += model.predict(test_f) / len(splits)
-        fold_corr    = pearson(y[va_idx], oof[va_idx])
-        print(f"  [{tag}] fold {fold_id}: Pearson={fold_corr:.6f}  best_iter={model.best_iteration}")
-        del model; gc.collect()
-
-    oof_corr = pearson(y, oof)
-    print(f"  [{tag}] OOF Pearson: {oof_corr:.6f}")
-    return oof, test_pred, oof_corr
+    oof_score = pearson(y, oof)
+    print(f"  [{tag}] OOF Pearson: {oof_score:.6f}")
+    return oof, test_pred, oof_score, fold_scores
 
 
 # ── submission helper ──────────────────────────────────────────────────────────
@@ -246,11 +302,11 @@ def make_submission(test_ids, preds, name):
     if (np.abs(p) > 0).mean() < 0.10:
         p += 1e-9
     sub = pd.DataFrame({ID_COL: test_ids, TARGET_COL: p})
-    assert np.isfinite(sub[TARGET_COL]).all()
-    assert (sub[TARGET_COL].abs() > 0).mean() >= 0.10
+    assert np.isfinite(sub[TARGET_COL]).all(), "Non-finite predictions"
+    assert (sub[TARGET_COL].abs() > 0).mean() >= 0.10, "< 10% non-zero"
     path = OUTPUT_DIR / f"submission_{name}.csv"
     sub.to_csv(path, index=False)
-    print(f"  Saved: {path}  rows={len(sub):,}")
+    print(f"  Saved: {path}  ({len(sub):,} rows)")
     return sub
 
 
@@ -261,98 +317,157 @@ def main():
     df_test  = pd.read_csv(TEST_PATH)
     print(f"  train: {df_train.shape}  test: {df_test.shape}")
 
-    feature_cols = [c for c in df_train.columns if c not in [ID_COL, TARGET_COL]]
-    splits = contiguous_time_splits(df_train[TIME_COL])
+    # ── feature sets ──────────────────────────────────────────────────────────
+    meta_cols, anon_cols, anon_numeric_cols = get_feature_sets(df_train)
+    print(f"\n  meta_cols ({len(meta_cols)}): {meta_cols}")
+    print(f"  anon_cols: {len(anon_cols)}  |  anon_numeric: {len(anon_numeric_cols)}")
 
-    # ── Phase 1: per-feature correlation ──────────────────────────────────────
-    df_corr = per_feature_correlation(df_train, feature_cols)
-    top_features = df_corr["feature"].tolist()  # sorted by |corr|
+    # ── walk-forward splits ────────────────────────────────────────────────────
+    splits = walk_forward_time_splits(df_train[TIME_COL])
+    print("\nWalk-Forward Folds:")
+    for i, (tr, va) in enumerate(splits):
+        tr_di = df_train.iloc[tr][TIME_COL]
+        va_di = df_train.iloc[va][TIME_COL]
+        print(f"  fold {i}: train di [{tr_di.min()}–{tr_di.max()}]  "
+              f"valid di [{va_di.min()}–{va_di.max()}]  "
+              f"n_train={len(tr):,}  n_valid={len(va):,}  "
+              f"embargo_ok={tr_di.max() < va_di.min()}")
 
-    # ── Phase 2: cross-sectional normalization ─────────────────────────────────
+    # ── per-feature correlation (raw target, before ANY transform) ─────────────
     print("\n" + "="*60)
-    print("PHASE 2: Cross-sectional normalization per di")
+    print("Per-anonymous-feature Pearson with raw target (pre-transform)")
     print("="*60)
-    df_train_cs = cross_sectional_normalize(df_train, feature_cols)
-    df_test_cs  = cross_sectional_normalize(df_test,  feature_cols)
+    df_corr = per_feature_correlation(df_train, anon_numeric_cols)
+    df_corr.to_csv(OUTPUT_DIR / "feature_correlations.csv", index=False)
+    print("\nTop 20 anonymous features by |Pearson|:")
+    print(df_corr.head(20).to_string(index=False))
+    print(f"\nMax single-feature |Pearson|: {df_corr['corr'].max():.6f}")
+    top30_anon = df_corr["feature"].tolist()[:30]
 
-    # add rank features for top 30 most correlated
-    df_train_cs = add_rank_features(df_train_cs, top_features, top_n=30)
-    df_test_cs  = add_rank_features(df_test_cs,  top_features, top_n=30)
-
-    # ── Phase 3: fold-safe si history ─────────────────────────────────────────
+    # ── si history — FIRST, on raw data, before any anonymous transform ────────
     print("\n" + "="*60)
-    print("PHASE 3: Fold-safe per-si historical mean target")
+    print("Building forward-safe si history (raw si, before any normalization)")
     print("="*60)
-    df_train_cs, df_test_cs = add_si_target_history(df_train_cs, df_test_cs, splits)
+    si_col_before = df_train[STOCK_COL].copy()
+    meta_before   = df_train[meta_cols].copy()
 
-    feature_cols_enhanced = [c for c in df_train_cs.columns
-                              if c not in [ID_COL, TARGET_COL]]
+    df_train_h, df_test_h = add_forward_safe_si_history(df_train, df_test)
 
-    # ── Phase 4: models ────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 4a: CatBoost (1500 iter, enhanced features)")
-    print("="*60)
-    cb_oof, cb_test, cb_score = run_catboost(
-        df_train_cs, df_test_cs, feature_cols_enhanced, splits,
-        iterations=1500, tag="cb"
-    )
+    # Proof assertions
+    assert df_train_h[STOCK_COL].reset_index(drop=True).equals(
+        si_col_before.reset_index(drop=True)
+    ), "si column was mutated by add_forward_safe_si_history!"
+    for col in meta_cols:
+        assert df_train_h[col].reset_index(drop=True).equals(
+            meta_before[col].reset_index(drop=True)
+        ), f"Meta column '{col}' was mutated by add_forward_safe_si_history!"
+    print("  ✓ si column unchanged after si-history build")
+    print("  ✓ All meta columns unchanged after si-history build")
 
-    print("\n" + "="*60)
-    print("PHASE 4b: LightGBM (up to 2000 iter, enhanced features)")
-    print("="*60)
-    lgbm_available = True
-    try:
-        lgbm_oof, lgbm_test, lgbm_score = run_lgbm(
-            df_train_cs, df_test_cs, feature_cols_enhanced, splits, tag="lgbm"
-        )
-    except ImportError:
-        print("  LightGBM not installed, skipping.")
-        lgbm_available = False
+    hist_cols = ["si_hist_count", "si_hist_mean", "si_last_target", "si_hist_std"]
 
-    # ── ensemble ───────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("ENSEMBLE")
-    print("="*60)
+    # ── build the three transformed variants ──────────────────────────────────
+    # zscore anon only
+    df_train_z  = cross_sectional_zscore_anonymous(df_train_h, anon_numeric_cols)
+    df_test_z   = cross_sectional_zscore_anonymous(df_test_h,  anon_numeric_cols)
+
+    # Proof: meta cols untouched by z-score
+    for col in meta_cols:
+        assert df_train_z[col].reset_index(drop=True).equals(
+            df_train_h[col].reset_index(drop=True)
+        ), f"Z-score mutated meta column: {col}"
+    print("  ✓ Meta columns unchanged after cross-sectional z-score")
+
+    # rank (top30 anon only) — both on raw+history and on zscore+history
+    rank_cols   = [f"{c}_csrank" for c in top30_anon]
+    df_train_r  = add_rank_features(df_train_h, top30_anon)
+    df_test_r   = add_rank_features(df_test_h,  top30_anon)
+    df_train_zr = add_rank_features(df_train_z, top30_anon)
+    df_test_zr  = add_rank_features(df_test_z,  top30_anon)
+
+    # ── experiment definitions ─────────────────────────────────────────────────
+    experiments = [
+        {
+            "name":    "A_raw_features",
+            "df_tr":   df_train_h,
+            "df_te":   df_test_h,
+            "feat":    meta_cols + anon_cols,
+        },
+        {
+            "name":    "B_raw_plus_si_history",
+            "df_tr":   df_train_h,
+            "df_te":   df_test_h,
+            "feat":    meta_cols + anon_cols + hist_cols,
+        },
+        {
+            "name":    "C_raw_plus_rank_plus_si_history",
+            "df_tr":   df_train_r,
+            "df_te":   df_test_r,
+            "feat":    meta_cols + anon_cols + rank_cols + hist_cols,
+        },
+        {
+            "name":    "D_raw_plus_zscore_plus_rank_plus_si_history",
+            "df_tr":   df_train_zr,
+            "df_te":   df_test_zr,
+            "feat":    meta_cols + anon_cols + rank_cols + hist_cols,
+        },
+    ]
+
     y = df_train[TARGET_COL].to_numpy(np.float64)
+    results_rows = []
+    best_exp = None
 
-    results = {"catboost_oof_corr": cb_score}
-    best_test = cb_test
-    best_score = cb_score
-    best_name = "catboost"
+    for exp in experiments:
+        print(f"\n{'='*60}")
+        print(f"EXPERIMENT {exp['name']}")
+        feat_cols = [c for c in exp["feat"] if c in exp["df_tr"].columns]
+        print(f"  feature count: {len(feat_cols)}")
+        print("="*60)
 
-    if lgbm_available:
-        results["lgbm_oof_corr"] = lgbm_score
-        # simple 50/50 blend
-        blend_oof  = 0.5 * cb_oof  + 0.5 * lgbm_oof
-        blend_test = 0.5 * cb_test + 0.5 * lgbm_test
-        blend_score = pearson(y, blend_oof)
-        results["ensemble_50_50_oof_corr"] = blend_score
-        print(f"  CatBoost OOF: {cb_score:.6f}")
-        print(f"  LightGBM OOF: {lgbm_score:.6f}")
-        print(f"  50/50 blend:  {blend_score:.6f}")
+        oof, test_pred, oof_score, fold_scores = run_catboost(
+            exp["df_tr"], exp["df_te"], feat_cols, splits, meta_cols,
+            tag=exp["name"][:25],
+        )
 
-        # pick best
-        best_candidates = [
-            ("catboost", cb_score, cb_test),
-            ("lgbm",     lgbm_score, lgbm_test),
-            ("ensemble", blend_score, blend_test),
-        ]
-        best_name, best_score, best_test = max(best_candidates, key=lambda x: x[1])
-        print(f"  → Using: {best_name}  OOF={best_score:.6f}")
-    else:
-        print(f"  CatBoost only. OOF: {cb_score:.6f}")
+        # Save OOF predictions
+        pd.DataFrame({"oof_pred": oof, "target": y}).to_csv(
+            OUTPUT_DIR / f"oof_{exp['name']}.csv", index=False
+        )
+        make_submission(df_test[ID_COL], test_pred, exp["name"])
 
-    # ── save ───────────────────────────────────────────────────────────────────
-    make_submission(df_test[ID_COL], best_test, best_name)
+        row = {
+            "experiment":  exp["name"],
+            "n_features":  len(feat_cols),
+            "oof_pearson": round(oof_score, 6),
+        }
+        for i, s in enumerate(fold_scores):
+            row[f"fold_{i}"] = round(s, 6)
+        results_rows.append(row)
 
-    results["chosen_model"] = best_name
-    results["chosen_oof_corr"] = best_score
-    (OUTPUT_DIR / "advanced_summary.json").write_text(json.dumps(results, indent=2))
+        if best_exp is None or oof_score > best_exp["oof_score"]:
+            best_exp = {"name": exp["name"], "oof_score": oof_score}
+
+    # ── save & print summary ───────────────────────────────────────────────────
+    df_results = pd.DataFrame(results_rows).sort_values("oof_pearson", ascending=False)
+    df_results.to_csv(OUTPUT_DIR / "advanced_experiment_results.csv", index=False)
 
     print("\n" + "="*60)
-    print("FINAL SUMMARY")
+    print("EXPERIMENT SUMMARY (sorted by OOF Pearson)")
     print("="*60)
-    print(json.dumps(results, indent=2))
+    print(df_results.to_string(index=False))
+
+    print(f"\n→ Best experiment: {best_exp['name']}  OOF={best_exp['oof_score']:.6f}")
+    print("\nMeta column protection proof:")
+    for col in meta_cols:
+        print(f"  {col}: unchanged ✓")
+    print("si history built before any anonymous normalization: ✓")
+
+    summary = {
+        "best_experiment":  best_exp["name"],
+        "best_oof_pearson": best_exp["oof_score"],
+        "experiments":      results_rows,
+    }
+    (OUTPUT_DIR / "advanced_summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
 
 
