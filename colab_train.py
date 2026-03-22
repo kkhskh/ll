@@ -79,7 +79,31 @@ def walk_forward_splits(time_series, n_splits=N_SPLITS, min_train=252, embargo=5
     return splits
 
 
-def cross_sectional_normalize(df, num_cols, group_col='di'):
+def compute_feature_correlations(df_train, feature_cols, target_col='target'):
+    """Compute per-feature Pearson correlation with target. Returns sorted DataFrame."""
+    y = df_train[target_col].to_numpy(np.float64)
+    num_cols = [c for c in feature_cols if c not in CAT_COLS and c != TIME_COL]
+    rows = []
+    for c in num_cols:
+        x = df_train[c].to_numpy(np.float64)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 100:
+            rows.append({"feature": c, "pearson": 0.0})
+            continue
+        corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
+        rows.append({"feature": c, "pearson": corr if np.isfinite(corr) else 0.0})
+    df_corr = pd.DataFrame(rows).sort_values("pearson", key=abs, ascending=False)
+    return df_corr
+
+
+def select_top_features(df_corr, feature_cols, top_k=60, min_abs_corr=0.005):
+    """Return top_k features by absolute correlation that pass the min threshold."""
+    num_top = df_corr[df_corr["pearson"].abs() >= min_abs_corr]["feature"].tolist()[:top_k]
+    cat_keep = [c for c in feature_cols if c in CAT_COLS or c == TIME_COL]
+    return num_top + cat_keep
+
+
+
     """Z-score each numeric feature within each date cross-section (no look-ahead)."""
     arr = df[num_cols].to_numpy(np.float64)
     groups = df[group_col].to_numpy()
@@ -245,12 +269,12 @@ def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=False):
     params = dict(
         objective="regression",
         metric="rmse",
-        num_leaves=255,
-        learning_rate=0.02,
-        feature_fraction=0.7,
+        num_leaves=63,
+        learning_rate=0.05,
+        feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=1,
-        min_child_samples=20,
+        min_child_samples=50,
         reg_alpha=0.1,
         reg_lambda=1.0,
         device=device,
@@ -475,6 +499,18 @@ def main():
     # Cross-sectional normalize target (within-date z-score) — removes date-level drift
     # Keep original target for OOF Pearson scoring; use CS target for model training
     df_train, y_orig = cross_sectional_normalize_target(df_train)
+
+    # Per-feature correlation analysis — find which features actually predict the target
+    print("Computing per-feature correlations with target...")
+    df_corr = compute_feature_correlations(df_train, feature_cols)
+    print("\nTop 20 features by |Pearson| with target:")
+    print(df_corr.head(20).to_string(index=False))
+    top_corr = df_corr["pearson"].abs().max()
+    print(f"\nSingle-best-feature Pearson: {top_corr:.6f}")
+
+    # Use only top features to reduce noise
+    feature_cols = select_top_features(df_corr, feature_cols, top_k=60)
+    print(f"Using {len(feature_cols)} features for modeling\n")
 
     splits = walk_forward_splits(df_train[TIME_COL])
     y = df_train[TARGET_COL].to_numpy(np.float64)  # CS-normalized target for training
