@@ -237,7 +237,25 @@ def add_rank_features(df, rank_source_cols, group_col=TIME_COL, suffix="_csrank"
 
 
 # ── CatBoost CV ────────────────────────────────────────────────────────────────
-def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterations=1000):
+class PearsonEvalMetric:
+    """Custom CatBoost eval metric: maximize Pearson correlation directly."""
+    def get_final_error(self, error, weight):
+        return error
+
+    def is_max_optimal(self):
+        return True  # higher = better
+
+    def evaluate(self, approxes, target, weight):
+        pred = np.array(approxes[0], dtype=np.float64)
+        targ = np.array(target,      dtype=np.float64)
+        mask = np.isfinite(pred) & np.isfinite(targ)
+        if mask.sum() < 2 or np.std(pred[mask]) == 0 or np.std(targ[mask]) == 0:
+            return 0.0, 1
+        r = float(np.corrcoef(pred[mask], targ[mask])[0, 1])
+        return (r if np.isfinite(r) else 0.0), 1
+
+
+def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterations=3000):
     from catboost import CatBoostRegressor
 
     # Only keep cols present in both dataframes
@@ -264,7 +282,7 @@ def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterat
 
         model = CatBoostRegressor(
             loss_function="RMSE",
-            eval_metric="RMSE",
+            eval_metric=PearsonEvalMetric(),   # stop on Pearson, not RMSE
             depth=6,
             learning_rate=0.05,
             iterations=iterations,
@@ -273,7 +291,7 @@ def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterat
             subsample=0.8,
             bootstrap_type="Bernoulli",
             od_type="Iter",
-            od_wait=100,
+            od_wait=300,                       # give model 300 rounds to improve Pearson
             verbose=False,
         )
         model.fit(
