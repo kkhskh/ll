@@ -102,8 +102,7 @@ def select_top_features(df_corr, feature_cols, top_k=60, min_abs_corr=0.005):
     cat_keep = [c for c in feature_cols if c in CAT_COLS or c == TIME_COL]
     return num_top + cat_keep
 
-
-
+def cross_sectional_normalize(df, num_cols, group_col='di'):
     """Z-score each numeric feature within each date cross-section (no look-ahead)."""
     arr = df[num_cols].to_numpy(np.float64)
     groups = df[group_col].to_numpy()
