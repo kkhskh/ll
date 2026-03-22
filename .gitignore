@@ -1,0 +1,8 @@
+artifacts/
+output/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+train.csv
+test.csv

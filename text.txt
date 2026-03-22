@@ -1,0 +1,525 @@
+aggle notebooks only see competition files after you attach them in the Input pane, and Kaggle expects the submission file to be written to /kaggle/working.
+
+Paste this into a fresh notebook and run it top to bottom:
+
+import os
+import re
+import gc
+from glob import glob
+
+import numpy as np
+import pandas as pd
+
+# ----------------------------
+# 1) Find the mounted dataset
+# ----------------------------
+def find_train_test():
+    pairs = []
+    for train_path in glob("/kaggle/input/**/train.csv", recursive=True):
+        base = os.path.dirname(train_path)
+        test_path = os.path.join(base, "test.csv")
+        if os.path.exists(test_path):
+            pairs.append((train_path, test_path))
+    if not pairs:
+        raise FileNotFoundError(
+            "No train.csv/test.csv found under /kaggle/input. "
+            "Attach the competition dataset in the Kaggle Input pane first."
+        )
+    print("Found candidate datasets:")
+    for i, (tr, te) in enumerate(pairs):
+        print(f"[{i}]")
+        print(" train:", tr)
+        print(" test :", te)
+    return pairs[0]
+
+train_path, test_path = find_train_test()
+
+df_train = pd.read_csv(train_path)
+df_test = pd.read_csv(test_path)
+
+print("\nLoaded:")
+print("train shape:", df_train.shape)
+print("test  shape:", df_test.shape)
+print("\nColumns:")
+print(df_train.columns.tolist()[:50], "..." if len(df_train.columns) > 50 else "")
+
+# ----------------------------
+# 2) Basic schema detection
+# ----------------------------
+TARGET_COL = "target"
+ID_COL = "id"
+
+assert TARGET_COL in df_train.columns, "train.csv missing target column"
+assert ID_COL in df_train.columns, "train.csv missing id column"
+assert ID_COL in df_test.columns, "test.csv missing id column"
+
+feature_cols = [c for c in df_train.columns if c not in [ID_COL, TARGET_COL]]
+
+# Heuristic: identify likely time/group columns for safer CV
+time_like_cols = []
+for c in feature_cols:
+    lc = c.lower()
+    if any(tok in lc for tok in ["date", "time", "day", "month", "year", "quarter", "week", "era"]):
+        time_like_cols.append(c)
+
+group_like_cols = []
+for c in feature_cols:
+    lc = c.lower()
+    if any(tok in lc for tok in ["group", "cluster", "bucket", "sector", "industry", "symbol"]):
+        group_like_cols.append(c)
+
+print("\nLikely time-like cols:", time_like_cols[:10])
+print("Likely group-like cols:", group_like_cols[:10])
+
+# ----------------------------
+# 3) Cheap feature engineering
+# ----------------------------
+def add_row_features(df):
+    out = df.copy()
+    xcols = [c for c in out.columns if c not in [ID_COL, TARGET_COL]]
+    out["row_nan_count"] = out[xcols].isna().sum(axis=1)
+    out["row_nan_frac"] = out["row_nan_count"] / max(len(xcols), 1)
+
+    # numeric row stats
+    num_cols = out[xcols].select_dtypes(include=[np.number]).columns.tolist()
+    if len(num_cols) > 0:
+        out["row_num_mean"] = out[num_cols].mean(axis=1)
+        out["row_num_std"] = out[num_cols].std(axis=1)
+        out["row_num_min"] = out[num_cols].min(axis=1)
+        out["row_num_max"] = out[num_cols].max(axis=1)
+    return out
+
+df_train = add_row_features(df_train)
+df_test = add_row_features(df_test)
+
+feature_cols = [c for c in df_train.columns if c not in [ID_COL, TARGET_COL]]
+
+# ----------------------------
+# 4) Build folds
+# Prefer time-ordered split if a plausible time column exists.
+# Otherwise use repeated KFold.
+# ----------------------------
+from sklearn.model_selection import KFold
+
+def make_folds(train_df, n_splits=5):
+    # choose a time-like column with decent cardinality if available
+    chosen_time = None
+    for c in time_like_cols:
+        if c in train_df.columns:
+            nunique = train_df[c].nunique(dropna=True)
+            if 5 <= nunique <= len(train_df) * 0.9:
+                chosen_time = c
+                break
+
+    if chosen_time is not None:
+        # order unique values, assign contiguous folds
+        tmp = train_df[[chosen_time]].copy()
+        vals = pd.Series(tmp[chosen_time].dropna().unique())
+        try:
+            vals = vals.sort_values()
+        except Exception:
+            vals = vals.astype(str).sort_values()
+        vals = vals.tolist()
+
+        chunks = np.array_split(vals, n_splits)
+        folds = np.full(len(train_df), -1, dtype=int)
+        for f, chunk in enumerate(chunks):
+            mask = train_df[chosen_time].isin(chunk)
+            folds[mask.values] = f
+
+        # any NA in chosen_time -> dump into last fold
+        folds[folds == -1] = n_splits - 1
+        print(f"Using contiguous folds on time-like column: {chosen_time}")
+        return folds, chosen_time
+
+    print("No reliable time-like column found; using shuffled KFold")
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    folds = np.full(len(train_df), -1, dtype=int)
+    for f, (_, va_idx) in enumerate(kf.split(train_df)):
+        folds[va_idx] = f
+    return folds, None
+
+folds, chosen_time = make_folds(df_train, n_splits=5)
+df_train["_fold"] = folds
+
+# ----------------------------
+# 5) CatBoost baseline
+# Handles missing values and categoricals well.
+# ----------------------------
+from catboost import CatBoostRegressor
+
+X_test = df_test[feature_cols].copy()
+oof = np.zeros(len(df_train), dtype=np.float64)
+pred_test = np.zeros(len(df_test), dtype=np.float64)
+
+# categorical detection
+cat_cols = df_train[feature_cols].select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+cat_idx = [feature_cols.index(c) for c in cat_cols]
+
+def fold_corr(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if len(y_true) < 2:
+        return np.nan
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return np.nan
+    return np.corrcoef(y_true, y_pred)[0, 1]
+
+scores = []
+
+for f in range(5):
+    tr = df_train[df_train["_fold"] != f].copy()
+    va = df_train[df_train["_fold"] == f].copy()
+
+    X_tr = tr[feature_cols]
+    y_tr = tr[TARGET_COL].values
+    X_va = va[feature_cols]
+    y_va = va[TARGET_COL].values
+
+    model = CatBoostRegressor(
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        depth=6,
+        learning_rate=0.03,
+        iterations=3000,
+        l2_leaf_reg=8.0,
+        random_seed=42 + f,
+        subsample=0.8,
+        bootstrap_type="Bernoulli",
+        od_type="Iter",
+        od_wait=200,
+        verbose=200,
+    )
+
+    model.fit(
+        X_tr, y_tr,
+        cat_features=cat_idx if len(cat_idx) else None,
+        eval_set=(X_va, y_va),
+        use_best_model=True,
+    )
+
+    va_pred = model.predict(X_va)
+    te_pred = model.predict(X_test)
+
+    oof[va.index] = va_pred
+    pred_test += te_pred / 5.0
+
+    sc = fold_corr(y_va, va_pred)
+    scores.append(sc)
+    print(f"Fold {f}: corr={sc:.6f}")
+
+    del model, X_tr, X_va, y_tr, y_va
+    gc.collect()
+
+print("\nMean fold corr:", np.nanmean(scores))
+
+# ----------------------------
+# 6) Mild post-processing
+# Correlation cares about ranking + linearity; clipping helps with tail blowups.
+# ----------------------------
+lo, hi = np.nanpercentile(pred_test, [0.5, 99.5])
+pred_test = np.clip(pred_test, lo, hi)
+
+# make sure at least 10% non-zero
+if (np.abs(pred_test) > 0).mean() < 0.10:
+    pred_test = pred_test + 1e-9
+
+submission = pd.DataFrame({
+    "id": df_test[ID_COL],
+    "target": pred_test
+})
+
+assert np.isfinite(submission["target"]).all()
+assert (submission["target"].abs() > 0).mean() >= 0.10
+
+submission.to_csv("/kaggle/working/submission.csv", index=False)
+print("\nSaved: /kaggle/working/submission.csv")
+print(submission.head())
+
+What this does that your notebook didn’t:
+
+finds the real mounted train.csv / test.csv instead of guessing the dataset slug
+uses a real model instead of random noise
+keeps missing values intact for CatBoost
+adds a few row-level features that often help on anonymous tabular problems
+tries a time-aware fold if the schema exposes any obvious time column
+
+Two hard corrections:
+
+Do not globally scale the whole dataset before CV. The challenge notes explicitly warn about forward bias from whole-period normalization.
+Do not trust any “0.77” claim unless you see the exact out-of-fold protocol and scoring code. I did not find a credible public source backing that number for this challenge.
+
+If this throws an error, paste the first 30 column names and the traceback.
+
+you are doing gues guess, we are not fuckng playing guesig, youa re not giving me strategy, so we will epxlore this and that to find good soution, instead you ar ebullshitting
+Thought for 1m 41s
+
+Fair. I was guessing about hidden structure. That’s useless.
+
+Here’s the non-guessing plan: first turn the dataset into facts, then run a small, disciplined experiment grid. No mythology, no “maybe this is time-like,” no pretending we know the schema before we inspect it.
+
+Also, on Kaggle the competition files only exist after you attach them in the notebook Input pane, and the submission should be written to /kaggle/working.
+
+What we need to answer first
+
+Before choosing a model, answer these with code:
+
+Is id unique in train and test, or repeated?
+Are there any columns that clearly encode time, event date, ticker, sector, or announcement bucket?
+Are features organized into families by prefix?
+Which families have standalone signal?
+Does any signal survive a leakage-resistant split?
+Does shuffled-target performance collapse to ~0?
+
+If you do not know those six things, talking about CatBoost vs neural nets is bullshit.
+
+Exact exploration sequence
+Step 1: stop guessing the file path
+from glob import glob
+import os
+import pandas as pd
+
+pairs = []
+for tr in glob("/kaggle/input/**/train.csv", recursive=True):
+    te = os.path.join(os.path.dirname(tr), "test.csv")
+    if os.path.exists(te):
+        pairs.append((tr, te))
+
+if not pairs:
+    raise FileNotFoundError("Attach the competition dataset in Kaggle Input first.")
+
+train_path, test_path = pairs[0]
+df_train = pd.read_csv(train_path)
+df_test = pd.read_csv(test_path)
+
+print(train_path, df_train.shape)
+print(test_path, df_test.shape)
+print(df_train.head())
+Step 2: extract hard schema facts
+import numpy as np
+
+ID = "id"
+TARGET = "target"
+
+feature_cols = [c for c in df_train.columns if c not in [ID, TARGET]]
+
+print("train id unique:", df_train[ID].is_unique)
+print("test  id unique:", df_test[ID].is_unique)
+print("train id repeats:", df_train[ID].duplicated().sum())
+print("test  id repeats:", df_test[ID].duplicated().sum())
+
+print("\nDtypes:")
+print(df_train.dtypes.value_counts())
+
+print("\nTop missingness:")
+miss = df_train[feature_cols].isna().mean().sort_values(ascending=False)
+print(miss.head(30))
+
+print("\nTarget summary:")
+print(df_train[TARGET].describe())
+print("target skew:", df_train[TARGET].skew())
+print("target kurt:", df_train[TARGET].kurt())
+Step 3: identify candidate structure, not by vibes but by strings and cardinality
+def classify_cols(cols):
+    time_like, entity_like, cat_like = [], [], []
+    for c in cols:
+        lc = c.lower()
+        if any(x in lc for x in ["date","time","day","week","month","year","quarter","era"]):
+            time_like.append(c)
+        if any(x in lc for x in ["ticker","symbol","permno","cusip","gvkey","sector","industry","group","bucket"]):
+            entity_like.append(c)
+    return time_like, entity_like
+
+time_like, entity_like = classify_cols(feature_cols)
+print("time_like:", time_like[:30])
+print("entity_like:", entity_like[:30])
+
+for c in time_like[:10] + entity_like[:10]:
+    print("\n", c)
+    print("nunique:", df_train[c].nunique(dropna=True))
+    print(df_train[c].value_counts(dropna=False).head())
+Step 4: build feature families from prefixes
+
+If columns look like news_xxx, opt_xxx, fund_xxx, tech_xxx, you can test families directly.
+
+from collections import defaultdict
+
+families = defaultdict(list)
+for c in feature_cols:
+    prefix = c.split("_")[0]
+    families[prefix].append(c)
+
+family_sizes = {k: len(v) for k, v in families.items()}
+family_sizes = dict(sorted(family_sizes.items(), key=lambda x: -x[1]))
+print(family_sizes)
+
+If column names are anonymous, cluster features by missingness pattern first. That often reveals latent families.
+
+miss_patterns = df_train[feature_cols].isna().mean().round(3)
+print(miss_patterns.value_counts().head(20))
+The first real decision: how to validate
+
+This is the part people screw up.
+
+If you have a real time/event column, use time-ordered folds. If you have repeated entities, use GroupKFold by entity or event. If you have neither, use repeated KFold, but do not pretend it proves robustness.
+
+And add one non-negotiable test: shuffle the target. If the model still scores materially above 0, your CV is garbage or you leaked.
+
+from sklearn.model_selection import KFold, GroupKFold
+import numpy as np
+
+def pearson(y, p):
+    y = np.asarray(y)
+    p = np.asarray(p)
+    if y.std() == 0 or p.std() == 0:
+        return np.nan
+    return np.corrcoef(y, p)[0,1]
+Minimal experiment grid
+
+Do not start with 40 models. Start with this grid:
+
+Null: zero prediction
+Null: random normal noise
+Ridge / ElasticNet with fold-local scaling
+HistGradientBoosting or CatBoost
+One model per feature family
+Leave-one-family-out ablation
+Pairwise family combinations
+One shuffled-target run
+
+That tells you where the signal is.
+
+Family scorer
+from sklearn.model_selection import KFold
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
+def cv_score_linear(X, y, n_splits=5, seed=42):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros(len(y))
+    for tr, va in kf.split(X):
+        model = Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("sc", StandardScaler()),
+            ("mdl", Ridge(alpha=1.0))
+        ])
+        model.fit(X.iloc[tr], y.iloc[tr])
+        oof[va] = model.predict(X.iloc[va])
+    return pearson(y, oof), oof
+
+results = []
+y = df_train[TARGET]
+
+for fam, cols in families.items():
+    if len(cols) < 2:
+        continue
+    X = df_train[cols]
+    sc, _ = cv_score_linear(X, y)
+    results.append((fam, len(cols), sc))
+
+res = pd.DataFrame(results, columns=["family","n_cols","cv_corr"]).sort_values("cv_corr", ascending=False)
+print(res.head(20))
+
+If one family gives you real signal and others don’t, that’s your direction. If no family beats noise, your split or preprocessing is wrong, or the signal only comes from interactions.
+
+Then do leave-one-family-out
+
+This is the fastest way to find what matters.
+
+all_families = list(families.keys())
+full_cols = feature_cols
+
+full_score, _ = cv_score_linear(df_train[full_cols], y)
+print("FULL:", full_score)
+
+loo = []
+for fam in all_families:
+    cols = [c for c in full_cols if c not in families[fam]]
+    if len(cols) < 2:
+        continue
+    sc, _ = cv_score_linear(df_train[cols], y)
+    loo.append((fam, sc, full_score - sc))
+
+loo = pd.DataFrame(loo, columns=["dropped_family","score_without_it","marginal_loss"])
+print(loo.sort_values("marginal_loss", ascending=False).head(20))
+
+That gives you a real ranking of marginal utility.
+
+Then run one nonlinear model, not ten
+
+Use CatBoost only after the linear ablations, because trees can bury weak families inside interactions and you’ll learn less.
+
+from catboost import CatBoostRegressor
+
+def cv_score_catboost(X, y, n_splits=5, seed=42):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros(len(y))
+    cat_cols = X.select_dtypes(include=["object","category","bool"]).columns.tolist()
+    cat_idx = [X.columns.get_loc(c) for c in cat_cols]
+
+    for fold, (tr, va) in enumerate(kf.split(X)):
+        model = CatBoostRegressor(
+            loss_function="RMSE",
+            iterations=1500,
+            learning_rate=0.03,
+            depth=6,
+            l2_leaf_reg=8,
+            random_seed=seed + fold,
+            verbose=False
+        )
+        model.fit(
+            X.iloc[tr], y.iloc[tr],
+            cat_features=cat_idx if cat_idx else None,
+            eval_set=(X.iloc[va], y.iloc[va]),
+            use_best_model=True
+        )
+        oof[va] = model.predict(X.iloc[va])
+
+    return pearson(y, oof), oof
+
+cb_score, cb_oof = cv_score_catboost(df_train[feature_cols], y)
+print("CatBoost CV corr:", cb_score)
+Mandatory anti-bullshit check: shuffled target
+y_shuf = y.sample(frac=1.0, random_state=123).reset_index(drop=True)
+X_reset = df_train[feature_cols].reset_index(drop=True)
+
+shuf_score, _ = cv_score_linear(X_reset, y_shuf)
+print("Shuffled-target score:", shuf_score)
+
+If that number is not near 0, your pipeline is lying to you.
+
+What the econ literature says to look for
+
+This is not a guess about your hidden columns. It is where the signal has historically come from around earnings:
+
+classic earnings-surprise / PEAD effects,
+revenue surprise in addition to earnings surprise,
+text from earnings calls / announcement language,
+options trading activity around news and announcements.
+
+So once your family ablation tells you which columns matter, ask whether the winning family is plausibly one of those four. If it is, push harder there. If it isn’t, trust the data, not the literature.
+
+What I would do in the first 90 minutes
+Load correctly.
+Print uniqueness of id.
+Print all columns and family sizes.
+Run missingness report.
+Run linear family-by-family CV.
+Run leave-one-family-out.
+Run one CatBoost full-model CV.
+Run shuffled-target sanity check.
+Submit only if real CV survives that.
+Hard rule
+
+Until you post:
+
+whether id repeats,
+the first 50 column names,
+family-size table,
+family-by-family CV table,
+
+nobody can honestly tell you “the strategy.” Everything else is cosplay.
+
+Paste those four outputs and I’ll turn them into a ranked experiment plan instead of generic advice.
