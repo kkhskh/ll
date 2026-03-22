@@ -286,12 +286,13 @@ def run_mlp(df_train, df_test, feature_cols, splits, epochs):
     def impute_normalize(X_tr_raw, X_va_raw, X_te_raw=None):
         med = np.nanmedian(X_tr_raw, axis=0)
         std = np.nanstd(X_tr_raw, axis=0)
-        std[std == 0] = 1.0
+        # Columns entirely NaN → impute with 0, treat as constant
+        med = np.where(np.isnan(med), 0.0, med)
+        std = np.where(np.isnan(std) | (std == 0), 1.0, std)
         def _process(X):
             out = X.copy()
-            for j in range(out.shape[1]):
-                mask = np.isnan(out[:, j])
-                out[mask, j] = med[j]
+            nan_mask = np.isnan(out)
+            out[nan_mask] = np.take(med, np.where(nan_mask)[1])
             return (out - med) / (std + 1e-8)
         tr = _process(X_tr_raw).astype(np.float32)
         va = _process(X_va_raw).astype(np.float32)
@@ -488,18 +489,27 @@ def main():
         except Exception as e:
             print(f"MLP failed: {e}")
 
-    # ensemble
-    if len(oofs) == 1:
-        final_test = test_preds[0]
-        best_score = pearson(y, oofs[0])
-        blend_weights = {names[0]: 1.0}
+    # ensemble — drop any model whose OOF contains NaN
+    valid_oofs, valid_preds, valid_names = [], [], []
+    for o, tp, n in zip(oofs, test_preds, names):
+        if np.isnan(o).any():
+            print(f"  Skipping {n} from ensemble (NaN OOF)")
+        else:
+            valid_oofs.append(o); valid_preds.append(tp); valid_names.append(n)
+
+    if len(valid_oofs) == 0:
+        raise RuntimeError("All models produced NaN OOF — nothing to submit.")
+    elif len(valid_oofs) == 1:
+        final_test = valid_preds[0]
+        best_score = pearson(y, valid_oofs[0])
+        blend_weights = {valid_names[0]: 1.0}
     else:
-        final_test, best_score, blend_weights = best_blend(oofs, test_preds, y, names)
+        final_test, best_score, blend_weights = best_blend(valid_oofs, valid_preds, y, valid_names)
 
     make_submission(df_test[ID_COL], final_test, output_dir / "submission.csv")
 
     summary = {
-        "individual_oof": {n: pearson(y, o) for n, o in zip(names, oofs)},
+        "individual_oof": {n: float(pearson(y, o)) for n, o in zip(names, oofs)},
         "ensemble_oof": best_score,
         "blend_weights": blend_weights,
         "n_folds": len(splits),
