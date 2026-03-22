@@ -79,6 +79,41 @@ def walk_forward_splits(time_series, n_splits=N_SPLITS, min_train=252, embargo=5
     return splits
 
 
+def cross_sectional_normalize(df, num_cols, group_col='di'):
+    """Z-score each numeric feature within each date cross-section (no look-ahead)."""
+    arr = df[num_cols].to_numpy(np.float64)
+    groups = df[group_col].to_numpy()
+    result = arr.copy()
+    for g in np.unique(groups):
+        mask = groups == g
+        sub = arr[mask]
+        mu = np.nanmean(sub, axis=0)
+        sigma = np.nanstd(sub, axis=0)
+        sigma[sigma == 0] = 1.0
+        result[mask] = (sub - mu) / (sigma + 1e-8)
+    out = df.copy()
+    out[num_cols] = result.astype(np.float32)
+    return out
+
+
+def cross_sectional_normalize_target(df, target_col='target', group_col='di'):
+    """Z-score the target within each date. Returns modified df + original target array."""
+    orig = df[target_col].to_numpy(np.float64).copy()
+    arr = orig.copy()
+    groups = df[group_col].to_numpy()
+    for g in np.unique(groups):
+        mask = groups == g
+        sub = arr[mask]
+        mu = np.nanmean(sub)
+        sigma = np.nanstd(sub)
+        if sigma == 0:
+            sigma = 1.0
+        arr[mask] = (sub - mu) / (sigma + 1e-8)
+    out = df.copy()
+    out[target_col] = arr
+    return out, orig
+
+
 def make_submission(test_ids, preds, path):
     p = np.asarray(preds, np.float64).copy()
     lo, hi = np.nanpercentile(p, [0.5, 99.5])
@@ -175,7 +210,7 @@ def run_catboost(df_train, df_test, feature_cols, splits, iterations, gpu=True):
             subsample=0.8,
             bootstrap_type="Bernoulli",
             od_type="Iter",
-            od_wait=200,
+            od_wait=500,
             task_type=task_type,
             verbose=500,
         )
@@ -197,10 +232,10 @@ def run_catboost(df_train, df_test, feature_cols, splits, iterations, gpu=True):
 
 
 # ── LightGBM ───────────────────────────────────────────────────────────────────
-def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=True):
+def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=False):
     import lightgbm as lgb
-    device = "gpu" if gpu else "cpu"
-    print(f"\n── LightGBM ({device}, up to {iterations} iters) ──")
+    device = "cpu"   # GPU LightGBM requires max_bin<=255 and is unstable; CPU is reliable
+    print(f"\n── LightGBM (cpu, up to {iterations} iters) ──")
 
     tr_lg, te_lg, cat_features = prepare_for_lgbm(df_train, df_test, feature_cols)
     y = df_train[TARGET_COL].to_numpy(np.float64)
@@ -219,8 +254,7 @@ def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=True):
         reg_alpha=0.1,
         reg_lambda=1.0,
         device=device,
-        max_bin=255,          # GPU mode requires max_bin <= 255
-        n_jobs=-1,
+        n_jobs=4,
         verbose=-1,
         seed=SEED,
     )
@@ -431,8 +465,19 @@ def main():
 
     df_train, df_test = load_data(data_dir)
     feature_cols = [c for c in df_train.columns if c not in [ID_COL, TARGET_COL]]
+    num_feature_cols = [c for c in feature_cols if c not in CAT_COLS]
+
+    # Cross-sectional normalize: z-score each feature within each date
+    print("Cross-sectional normalizing features...")
+    df_train = cross_sectional_normalize(df_train, num_feature_cols)
+    df_test  = cross_sectional_normalize(df_test,  num_feature_cols)
+
+    # Cross-sectional normalize target (within-date z-score) — removes date-level drift
+    # Keep original target for OOF Pearson scoring; use CS target for model training
+    df_train, y_orig = cross_sectional_normalize_target(df_train)
+
     splits = walk_forward_splits(df_train[TIME_COL])
-    y = df_train[TARGET_COL].to_numpy(np.float64)
+    y = df_train[TARGET_COL].to_numpy(np.float64)  # CS-normalized target for training
 
     # print fold summary
     print("\nWalk-Forward Folds:")
@@ -501,15 +546,15 @@ def main():
         raise RuntimeError("All models produced NaN OOF — nothing to submit.")
     elif len(valid_oofs) == 1:
         final_test = valid_preds[0]
-        best_score = pearson(y, valid_oofs[0])
+        best_score = pearson(y_orig, valid_oofs[0])
         blend_weights = {valid_names[0]: 1.0}
     else:
-        final_test, best_score, blend_weights = best_blend(valid_oofs, valid_preds, y, valid_names)
+        final_test, best_score, blend_weights = best_blend(valid_oofs, valid_preds, y_orig, valid_names)
 
     make_submission(df_test[ID_COL], final_test, output_dir / "submission.csv")
 
     summary = {
-        "individual_oof": {n: float(pearson(y, o)) for n, o in zip(names, oofs)},
+        "individual_oof": {n: float(pearson(y_orig, o)) for n, o in zip(names, oofs)},
         "ensemble_oof": best_score,
         "blend_weights": blend_weights,
         "n_folds": len(splits),
