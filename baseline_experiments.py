@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +21,18 @@ TARGET_COL = "target"
 PRIMARY_TIME_COL = "di"
 PRIMARY_GROUP_COL = "si"
 META_COLS = ["si", "di", "industry", "sector", "top2000", "top1000", "top500"]
+
+
+@contextmanager
+def _ignore_sklearn_imputer_all_nan_feature_warnings():
+    """Walk-forward train slices often leave some f_* columns 100% NaN; median imputer warns."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Skipping features without any observed values",
+            category=UserWarning,
+        )
+        yield
 
 
 def parse_args() -> argparse.Namespace:
@@ -288,6 +302,10 @@ def evaluate_linear_model(
     covered = np.zeros(len(df_train), dtype=bool)
     fold_rows = []
 
+    print(
+        "  (Ridge) Some features are all-NaN in certain train folds; sklearn imputer skips them — expected."
+    )
+
     for fold_id, (train_idx, valid_idx) in enumerate(splits):
         model = Pipeline(
             steps=[
@@ -296,8 +314,9 @@ def evaluate_linear_model(
                 ("ridge", Ridge(alpha=1.0)),
             ]
         )
-        model.fit(X.iloc[train_idx], y[train_idx])
-        valid_pred = model.predict(X.iloc[valid_idx])
+        with _ignore_sklearn_imputer_all_nan_feature_warnings():
+            model.fit(X.iloc[train_idx], y[train_idx])
+            valid_pred = model.predict(X.iloc[valid_idx])
         oof[valid_idx] = valid_pred
         covered[valid_idx] = True
         fold_rows.append(
@@ -334,8 +353,9 @@ def fit_linear_submission(
             ("ridge", Ridge(alpha=1.0)),
         ]
     )
-    model.fit(X_train, y_train)
-    return model.predict(X_test)
+    with _ignore_sklearn_imputer_all_nan_feature_warnings():
+        model.fit(X_train, y_train)
+        return model.predict(X_test)
 
 
 def evaluate_catboost_like(
