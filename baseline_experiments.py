@@ -67,6 +67,23 @@ def pearson_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
+def oof_pearson_on_covered(
+    y: np.ndarray, oof: np.ndarray, covered: np.ndarray
+) -> tuple[float, float]:
+    """
+    OOF Pearson only on rows that appeared in at least one validation fold.
+    Warmup rows (never validated) must not be scored as if prediction were zero.
+    Returns (pearson_corr, coverage_frac).
+    """
+    covered = np.asarray(covered, dtype=bool)
+    y = np.asarray(y, dtype=np.float64)
+    oof = np.asarray(oof, dtype=np.float64)
+    coverage_frac = float(covered.mean())
+    if int(covered.sum()) < 2:
+        return float("nan"), coverage_frac
+    return pearson_corr(y[covered], oof[covered]), coverage_frac
+
+
 def load_data(train_path: str, test_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     df_train = pd.read_csv(train_path)
     df_test = pd.read_csv(test_path)
@@ -156,19 +173,6 @@ def grouped_kfold_splits(groups: pd.Series, n_splits: int) -> list[tuple[np.ndar
     splitter = GroupKFold(n_splits=n_splits)
     row_idx = np.arange(len(groups))
     return [(train_idx, valid_idx) for train_idx, valid_idx in splitter.split(row_idx, groups=groups)]
-
-
-def contiguous_time_splits(time_values: pd.Series, n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
-    unique_values = np.sort(time_values.dropna().unique())
-    chunks = np.array_split(unique_values, n_splits)
-    valid_masks = [time_values.isin(chunk).to_numpy() for chunk in chunks]
-    row_idx = np.arange(len(time_values))
-    splits = []
-    for valid_mask in valid_masks:
-        valid_idx = row_idx[valid_mask]
-        train_idx = row_idx[~valid_mask]
-        splits.append((train_idx, valid_idx))
-    return splits
 
 
 def walk_forward_time_splits(
@@ -281,6 +285,7 @@ def evaluate_linear_model(
     X = prepare_linear_frame(df_train, cols)
     y = df_train[TARGET_COL].to_numpy(dtype=np.float64)
     oof = np.zeros(len(df_train), dtype=np.float64)
+    covered = np.zeros(len(df_train), dtype=bool)
     fold_rows = []
 
     for fold_id, (train_idx, valid_idx) in enumerate(splits):
@@ -294,6 +299,7 @@ def evaluate_linear_model(
         model.fit(X.iloc[train_idx], y[train_idx])
         valid_pred = model.predict(X.iloc[valid_idx])
         oof[valid_idx] = valid_pred
+        covered[valid_idx] = True
         fold_rows.append(
             {
                 "fold": fold_id,
@@ -303,10 +309,13 @@ def evaluate_linear_model(
             }
         )
 
+    oof_corr, cov_frac = oof_pearson_on_covered(y, oof, covered)
     return {
-        "oof_corr": pearson_corr(y, oof),
+        "oof_corr": oof_corr,
+        "oof_coverage_frac": cov_frac,
         "folds": fold_rows,
         "oof_predictions": oof,
+        "oof_covered": covered,
     }
 
 
@@ -346,6 +355,7 @@ def evaluate_catboost_like(
         X = prepare_linear_frame(df_train, cols)
         X_test = prepare_linear_frame(df_test, cols)
         oof = np.zeros(len(df_train), dtype=np.float64)
+        covered = np.zeros(len(df_train), dtype=bool)
         test_pred = np.zeros(len(df_test), dtype=np.float64)
         fold_rows = []
         for fold_id, (train_idx, valid_idx) in enumerate(splits):
@@ -360,6 +370,7 @@ def evaluate_catboost_like(
             valid_pred = model.predict(X.iloc[valid_idx])
             test_fold_pred = model.predict(X_test)
             oof[valid_idx] = valid_pred
+            covered[valid_idx] = True
             test_pred += test_fold_pred / len(splits)
             fold_rows.append(
                 {
@@ -369,11 +380,14 @@ def evaluate_catboost_like(
                     "fold_corr": pearson_corr(y[valid_idx], valid_pred),
                 }
             )
+        oof_corr, cov_frac = oof_pearson_on_covered(y, oof, covered)
         return {
             "model_name": "HistGradientBoostingRegressor",
-            "oof_corr": pearson_corr(y, oof),
+            "oof_corr": oof_corr,
+            "oof_coverage_frac": cov_frac,
             "folds": fold_rows,
             "oof_predictions": oof,
+            "oof_covered": covered,
             "test_predictions": test_pred,
         }
 
@@ -384,6 +398,7 @@ def evaluate_catboost_like(
         test_cb[col] = test_cb[col].astype(str)
 
     oof = np.zeros(len(df_train), dtype=np.float64)
+    covered = np.zeros(len(df_train), dtype=bool)
     test_pred = np.zeros(len(df_test), dtype=np.float64)
     fold_rows = []
 
@@ -412,6 +427,7 @@ def evaluate_catboost_like(
         valid_pred = model.predict(train_cb.iloc[valid_idx])
         test_fold_pred = model.predict(test_cb)
         oof[valid_idx] = valid_pred
+        covered[valid_idx] = True
         test_pred += test_fold_pred / len(splits)
         fold_rows.append(
             {
@@ -422,11 +438,14 @@ def evaluate_catboost_like(
             }
         )
 
+    oof_corr, cov_frac = oof_pearson_on_covered(y, oof, covered)
     return {
         "model_name": "CatBoostRegressor",
-        "oof_corr": pearson_corr(y, oof),
+        "oof_corr": oof_corr,
+        "oof_coverage_frac": cov_frac,
         "folds": fold_rows,
         "oof_predictions": oof,
+        "oof_covered": covered,
         "test_predictions": test_pred,
     }
 
@@ -532,6 +551,7 @@ def main() -> None:
             {
                 "strategy": strategy_name,
                 "oof_corr": result["oof_corr"],
+                "oof_coverage_frac": result["oof_coverage_frac"],
                 "mean_fold_corr": float(np.nanmean([row["fold_corr"] for row in result["folds"]])),
             }
         )
@@ -546,11 +566,17 @@ def main() -> None:
                 "feature_group": group_name,
                 "n_cols": len(group_cols),
                 "oof_corr": result["oof_corr"],
+                "oof_coverage_frac": result["oof_coverage_frac"],
                 "mean_fold_corr": float(np.nanmean([row["fold_corr"] for row in result["folds"]])),
             }
         )
 
     linear_primary = evaluate_linear_model(df_train, cols, primary_splits)
+    print(
+        f"\nOOF scoring: Pearson on validated rows only "
+        f"(coverage_frac={linear_primary['oof_coverage_frac']:.4f}; "
+        f"warmup rows excluded from OOF correlation).\n"
+    )
     shuffled_target = df_train[TARGET_COL].sample(frac=1.0, random_state=123).reset_index(drop=True)
     shuffled_frame = df_train.copy()
     shuffled_frame[TARGET_COL] = shuffled_target
@@ -581,22 +607,30 @@ def main() -> None:
         "linear_primary_strategy": {
             "strategy": primary_strategy,
             "oof_corr": linear_primary["oof_corr"],
+            "oof_coverage_frac": linear_primary["oof_coverage_frac"],
             "folds": linear_primary["folds"],
         },
         "nonlinear_primary_strategy": {
             "model_name": nonlinear_result["model_name"],
             "strategy": primary_strategy,
             "oof_corr": nonlinear_result["oof_corr"],
+            "oof_coverage_frac": nonlinear_result["oof_coverage_frac"],
             "folds": nonlinear_result["folds"],
         },
         "shuffled_target_check": {
             "strategy": primary_strategy,
             "oof_corr": shuffled_result["oof_corr"],
+            "oof_coverage_frac": shuffled_result["oof_coverage_frac"],
             "folds": shuffled_result["folds"],
         },
         "chosen_submission_model": {
             "model_name": best_model_name,
             "oof_corr": best_score,
+            "oof_coverage_frac": (
+                nonlinear_result["oof_coverage_frac"]
+                if best_model_name != "linear_ridge"
+                else linear_primary["oof_coverage_frac"]
+            ),
         },
         "submission_checks": submission_checks,
     }

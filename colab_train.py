@@ -1,6 +1,5 @@
 """
-Trexquant Earnings Return Prediction - GPU Training Script
-Run on Google Colab Pro (H100) for best results.
+Trexquant Earnings Return Prediction - GPU training script for Colab/local.
 
 Usage in Colab:
     !python colab_train.py --data-dir /content/drive/MyDrive/trexquant
@@ -40,10 +39,10 @@ def parse_args():
     p.add_argument("--output-dir",default="output", help="Where to write submission + logs")
     p.add_argument("--kaggle",    action="store_true", help="Download data via Kaggle API")
     p.add_argument("--no-mlp",    action="store_true", help="Skip PyTorch MLP (faster debug)")
-    p.add_argument("--no-lgbm",   action="store_true", help="Skip LightGBM")
+    p.add_argument("--no-lgbm",   action="store_true", default=True, help="Skip LightGBM (broken at best_iter=1-3)")
     p.add_argument("--cb-iters",  type=int, default=5000, help="CatBoost iterations")
     p.add_argument("--lgbm-iters",type=int, default=3000, help="LightGBM iterations")
-    p.add_argument("--mlp-epochs",type=int, default=100,  help="MLP epochs per fold")
+    p.add_argument("--mlp-epochs",type=int, default=200,  help="MLP epochs per fold")
     return p.parse_args()
 
 
@@ -53,6 +52,24 @@ def pearson(y_true, y_pred):
     if y.size < 2 or np.std(y) == 0 or np.std(p) == 0:
         return float("nan")
     return float(np.corrcoef(y, p)[0, 1])
+
+
+def oof_covered_mask(n_rows: int, splits) -> np.ndarray:
+    m = np.zeros(n_rows, dtype=bool)
+    for _, va_idx in splits:
+        m[va_idx] = True
+    return m
+
+
+def oof_pearson_on_covered(y: np.ndarray, oof: np.ndarray, covered: np.ndarray) -> tuple[float, float]:
+    """Aggregate OOF Pearson only on rows that were in some validation fold (not zero-fill)."""
+    covered = np.asarray(covered, dtype=bool)
+    y = np.asarray(y, np.float64)
+    oof = np.asarray(oof, np.float64)
+    frac = float(covered.mean())
+    if int(covered.sum()) < 2:
+        return float("nan"), frac
+    return pearson(y[covered], oof[covered]), frac
 
 
 def walk_forward_splits(time_series, n_splits=N_SPLITS, min_train=252, embargo=5):
@@ -137,6 +154,36 @@ def cross_sectional_normalize_target(df, target_col='target', group_col='di'):
     return out, orig
 
 
+def add_si_momentum(df_train, df_test, target_col='target', time_col='di', stock_col='si'):
+    """
+    Rolling mean of CS-normalized target per stock (fold-safe — uses only past dates).
+    Captures persistent per-stock alpha: stocks that ranked high recently tend to again.
+    For test rows (no target available) we use the last training-period rolling value.
+    """
+    windows = [21, 63, 252]
+    pivot = df_train.pivot_table(values=target_col, index=time_col, columns=stock_col, aggfunc='mean')
+    new_cols = []
+
+    for w in windows:
+        col = f'si_mom_{w}'
+        new_cols.append(col)
+        # shift(1) so we never use the current period's target
+        rolled = pivot.shift(1).rolling(window=w, min_periods=max(3, w // 5)).mean()
+
+        # Build fast lookup dict {(di, si): value}
+        stacked = rolled.stack(dropna=False)
+        lookup = stacked.to_dict()
+
+        df_train[col] = [lookup.get((d, s), np.nan)
+                         for d, s in zip(df_train[time_col], df_train[stock_col])]
+
+        # Test: map last available rolling value per stock
+        last_vals = rolled.iloc[-1].to_dict()
+        df_test[col] = df_test[stock_col].map(last_vals)
+
+    return df_train, df_test, new_cols
+
+
 def make_submission(test_ids, preds, path):
     p = np.asarray(preds, np.float64).copy()
     lo, hi = np.nanpercentile(p, [0.5, 99.5])
@@ -219,6 +266,7 @@ def run_catboost(df_train, df_test, feature_cols, splits, iterations, gpu=True):
     tr_cb, te_cb, cat_features = prepare_for_catboost(df_train, df_test, feature_cols)
     y = df_train[TARGET_COL].to_numpy(np.float64)
     oof  = np.zeros(len(df_train))
+    covered = np.zeros(len(df_train), dtype=bool)
     test_pred = np.zeros(len(df_test))
 
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
@@ -244,13 +292,14 @@ def run_catboost(df_train, df_test, feature_cols, splits, iterations, gpu=True):
             use_best_model=True,
         )
         oof[va_idx]  = model.predict(tr_cb.iloc[va_idx])
+        covered[va_idx] = True
         test_pred   += model.predict(te_cb) / len(splits)
         fc = pearson(y[va_idx], oof[va_idx])
         print(f"  fold {fold_id}: Pearson={fc:.6f}  best_iter={model.best_iteration_}")
         del model; gc.collect()
 
-    oof_score = pearson(y, oof)
-    print(f"  CatBoost OOF Pearson: {oof_score:.6f}")
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
+    print(f"  CatBoost OOF Pearson (covered only): {oof_score:.6f}  coverage_frac={cov_frac:.4f}")
     return oof, test_pred, oof_score
 
 
@@ -263,6 +312,7 @@ def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=False):
     tr_lg, te_lg, cat_features = prepare_for_lgbm(df_train, df_test, feature_cols)
     y = df_train[TARGET_COL].to_numpy(np.float64)
     oof  = np.zeros(len(df_train))
+    covered = np.zeros(len(df_train), dtype=bool)
     test_pred = np.zeros(len(df_test))
 
     params = dict(
@@ -294,13 +344,14 @@ def run_lgbm(df_train, df_test, feature_cols, splits, iterations, gpu=False):
                        lgb.log_evaluation(500)],
         )
         oof[va_idx]  = model.predict(tr_lg.iloc[va_idx])
+        covered[va_idx] = True
         test_pred   += model.predict(te_lg) / len(splits)
         fc = pearson(y[va_idx], oof[va_idx])
         print(f"  fold {fold_id}: Pearson={fc:.6f}  best_iter={model.best_iteration}")
         del model; gc.collect()
 
-    oof_score = pearson(y, oof)
-    print(f"  LightGBM OOF Pearson: {oof_score:.6f}")
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
+    print(f"  LightGBM OOF Pearson (covered only): {oof_score:.6f}  coverage_frac={cov_frac:.4f}")
     return oof, test_pred, oof_score
 
 
@@ -359,6 +410,7 @@ def run_mlp(df_train, df_test, feature_cols, splits, epochs):
         return tr, va
 
     oof  = np.zeros(len(df_train))
+    covered = np.zeros(len(df_train), dtype=bool)
     test_preds_folds = []
 
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
@@ -379,7 +431,7 @@ def run_mlp(df_train, df_test, feature_cols, splits, epochs):
         opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-        best_val, best_weights, patience, no_improve = -1.0, None, 15, 0
+        best_val, best_weights, patience, no_improve = -1.0, None, 30, 0
 
         for epoch in range(epochs):
             model.train()
@@ -416,6 +468,7 @@ def run_mlp(df_train, df_test, feature_cols, splits, epochs):
         with torch.no_grad():
             oof[va_idx] = model(torch.tensor(X_va).to(device)).cpu().numpy()
             te_pred     = model(torch.tensor(X_te).to(device)).cpu().numpy()
+        covered[va_idx] = True
         test_preds_folds.append(te_pred)
 
         fc = pearson(y_va, oof[va_idx])
@@ -425,13 +478,13 @@ def run_mlp(df_train, df_test, feature_cols, splits, epochs):
             torch.cuda.empty_cache()
 
     test_pred = np.mean(test_preds_folds, axis=0)
-    oof_score = pearson(y_all, oof)
-    print(f"  MLP OOF Pearson: {oof_score:.6f}")
+    oof_score, cov_frac = oof_pearson_on_covered(y_all.astype(np.float64), oof, covered)
+    print(f"  MLP OOF Pearson (covered only): {oof_score:.6f}  coverage_frac={cov_frac:.4f}")
     return oof, test_pred, oof_score
 
 
 # ── ensemble ───────────────────────────────────────────────────────────────────
-def best_blend(oofs, test_preds, y, names):
+def best_blend(oofs, test_preds, y, names, covered: np.ndarray):
     """Grid-search blend weights over the collected models."""
     print("\n── Ensemble blend search ──")
     n = len(oofs)
@@ -453,7 +506,7 @@ def best_blend(oofs, test_preds, y, names):
             best_score = -1.0
             for weights in candidates:
                 blend = sum(w * o for w, o in zip(weights, oofs))
-                s = pearson(y, blend)
+                s, _ = oof_pearson_on_covered(y, blend, covered)
                 if s > best_score:
                     best_score = s
                     best_w = weights
@@ -462,14 +515,15 @@ def best_blend(oofs, test_preds, y, names):
             weights = [1.0 / n] * n
 
         blend = sum(w * o for w, o in zip(weights, oofs))
-        s = pearson(y, blend)
+        s, _ = oof_pearson_on_covered(y, blend, covered)
         if s > best_score:
             best_score = s
             best_w = weights
 
     for name, w in zip(names, best_w):
         print(f"  {name}: weight={w:.2f}")
-    print(f"  Blend OOF Pearson: {best_score:.6f}")
+    cov_frac = float(np.asarray(covered, dtype=bool).mean())
+    print(f"  Blend OOF Pearson (covered only): {best_score:.6f}  coverage_frac={cov_frac:.4f}")
 
     final_test = sum(w * tp for w, tp in zip(best_w, test_preds))
     return final_test, best_score, dict(zip(names, best_w))
@@ -499,7 +553,14 @@ def main():
     # Keep original target for OOF Pearson scoring; use CS target for model training
     df_train, y_orig = cross_sectional_normalize_target(df_train)
 
-    # Per-feature correlation analysis — find which features actually predict the target
+    # Per-stock momentum: rolling mean of CS target — fold-safe
+    print("Adding per-stock momentum features...")
+    df_train, df_test, mom_cols = add_si_momentum(df_train, df_test)
+    feature_cols = feature_cols + mom_cols
+    print(f"  Added {len(mom_cols)} momentum features: {mom_cols}")
+
+    # Global top-K feature selection (uses full train + targets — optimistic vs walk-forward;
+    # honest alternative: select inside each train fold only, as in advanced_experiments C/D.)
     print("Computing per-feature correlations with target...")
     df_corr = compute_feature_correlations(df_train, feature_cols)
     print("\nTop 20 features by |Pearson| with target:")
@@ -513,6 +574,7 @@ def main():
 
     splits = walk_forward_splits(df_train[TIME_COL])
     y = df_train[TARGET_COL].to_numpy(np.float64)  # CS-normalized target for training
+    oof_covered = oof_covered_mask(len(df_train), splits)
 
     # print fold summary
     print("\nWalk-Forward Folds:")
@@ -581,15 +643,21 @@ def main():
         raise RuntimeError("All models produced NaN OOF — nothing to submit.")
     elif len(valid_oofs) == 1:
         final_test = valid_preds[0]
-        best_score = pearson(y_orig, valid_oofs[0])
+        best_score, _cov = oof_pearson_on_covered(y_orig, valid_oofs[0], oof_covered)
         blend_weights = {valid_names[0]: 1.0}
     else:
-        final_test, best_score, blend_weights = best_blend(valid_oofs, valid_preds, y_orig, valid_names)
+        final_test, best_score, blend_weights = best_blend(
+            valid_oofs, valid_preds, y_orig, valid_names, oof_covered
+        )
 
     make_submission(df_test[ID_COL], final_test, output_dir / "submission.csv")
 
     summary = {
-        "individual_oof": {n: float(pearson(y_orig, o)) for n, o in zip(names, oofs)},
+        "individual_oof": {
+            n: float(oof_pearson_on_covered(y_orig, o, oof_covered)[0])
+            for n, o in zip(names, oofs)
+        },
+        "oof_coverage_frac": float(oof_covered.mean()),
         "ensemble_oof": best_score,
         "blend_weights": blend_weights,
         "n_folds": len(splits),

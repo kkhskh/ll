@@ -8,6 +8,10 @@ Five steps:
   4. INTERACTION FEATURES  — ratios & diffs between family representatives
   5. CONDITIONAL MODELS    — sector/industry-conditioned CatBoost vs global
 
+Walk-forward OOF aggregates use a validation-row union mask (no zero-fill in Pearson).
+Step 4 mines interactions on the full training set (target-aware, optimistic vs strict
+fold-local selection). See advanced_experiments.py for fold-local rank selection.
+
 No new third-party packages. Uses only numpy, pandas, scipy (already installed via sklearn).
 """
 from __future__ import annotations
@@ -47,6 +51,14 @@ def pearson(y_true, y_pred):
     if y.size < 2 or np.std(y) == 0 or np.std(p) == 0:
         return float("nan")
     return float(np.corrcoef(y, p)[0, 1])
+
+
+def oof_valid_mask(n_rows: int, splits) -> np.ndarray:
+    """Rows that appear in any walk-forward validation fold (exclude warmup zero-fill)."""
+    m = np.zeros(n_rows, dtype=bool)
+    for _, va in splits:
+        m[va] = True
+    return m
 
 
 def walk_forward_splits(time_series, n_splits=N_SPLITS, min_train=252, embargo=5):
@@ -136,6 +148,7 @@ def submission_audit(df_train, df_test, splits):
         te_cb[c] = te_cb[c].astype(str)
 
     oof       = np.zeros(len(df_train))
+    covered   = np.zeros(len(df_train), dtype=bool)
     test_pred = np.zeros(len(df_test))
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
         model = CatBoostRegressor(
@@ -148,11 +161,16 @@ def submission_audit(df_train, df_test, splits):
                   eval_set=(tr_cb.iloc[va_idx], y[va_idx]),
                   use_best_model=True)
         oof[va_idx]  = model.predict(tr_cb.iloc[va_idx])
+        covered[va_idx] = True
         test_pred   += model.predict(te_cb) / len(splits)
         del model; gc.collect()
 
-    baseline_oof_score = pearson(y, oof)
-    print(f"  Reference CatBoost OOF Pearson: {baseline_oof_score:.6f}")
+    cov_frac = float(covered.mean())
+    baseline_oof_score = (
+        pearson(y[covered], oof[covered]) if int(covered.sum()) >= 2 else float("nan")
+    )
+    print(f"  Reference CatBoost OOF Pearson (covered only): {baseline_oof_score:.6f}  "
+          f"coverage_frac={cov_frac:.4f}")
 
     variants = {}
 
@@ -571,6 +589,8 @@ def run_conditional_models(df_train, df_test, anon_cols, splits, group_col="sect
     if TIME_COL in df_train.columns:
         feat_cols = [TIME_COL] + feat_cols
 
+    covered = oof_valid_mask(len(df_train), splits)
+
     # ── global model (reference) ───────────────────────────────────────────────
     oof_global = np.zeros(len(df_train))
     test_global = np.zeros(len(df_test))
@@ -590,8 +610,9 @@ def run_conditional_models(df_train, df_test, anon_cols, splits, group_col="sect
         test_global        += model.predict(df_test[[c for c in feat_cols if c in df_test.columns]]) / len(splits)
         del model; gc.collect()
 
-    global_oof_score = pearson(y, oof_global)
-    print(f"\n  Global model OOF Pearson:      {global_oof_score:.6f}")
+    global_oof_score = pearson(y[covered], oof_global[covered])
+    print(f"\n  Global model OOF Pearson (covered): {global_oof_score:.6f}  "
+          f"coverage_frac={covered.mean():.4f}")
 
     # ── conditional model: train separate model per group ─────────────────────
     oof_cond  = np.zeros(len(df_train))
@@ -648,15 +669,16 @@ def run_conditional_models(df_train, df_test, anon_cols, splits, group_col="sect
         else:
             pass
 
-        g_score = pearson(y[g_mask_train], oof_cond[g_mask_train])
-        group_scores[g] = round(g_score, 6)
+        cm = covered & g_mask_train
+        g_score = pearson(y[cm], oof_cond[cm]) if cm.sum() >= 2 else float("nan")
+        group_scores[g] = round(g_score, 6) if np.isfinite(g_score) else None
         print(f"    {group_col}={g:>10s}: n_train={g_mask_train.sum():,}  "
-              f"OOF Pearson={g_score:.6f}")
+              f"OOF Pearson(covered)={g_score:.6f}")
 
     # for groups that had fallback, oof_cond already set to global
-    cond_oof_score = pearson(y, oof_cond)
-    print(f"\n  Conditional model OOF Pearson: {cond_oof_score:.6f}")
-    print(f"  Global model OOF Pearson:      {global_oof_score:.6f}")
+    cond_oof_score = pearson(y[covered], oof_cond[covered])
+    print(f"\n  Conditional model OOF Pearson (covered): {cond_oof_score:.6f}")
+    print(f"  Global model OOF Pearson (covered):    {global_oof_score:.6f}")
     print(f"  Δ (cond - global):             {cond_oof_score - global_oof_score:+.6f}")
     if cond_oof_score > global_oof_score:
         print(f"  → Conditional model wins. Sector-conditioned signal is real.")
@@ -722,6 +744,7 @@ def main():
         feat_with_ix = anon_cols + ix_cols
         feat_with_ix = [c for c in feat_with_ix if c in df_train_ix.columns and c in df_test_ix.columns]
         oof_ix = np.zeros(len(df_train_ix))
+        covered_ix = oof_valid_mask(len(df_train_ix), splits)
         test_pred_ix = np.zeros(len(df_test_ix))
         for fold_id, (tr_idx, va_idx) in enumerate(splits):
             model = CatBoostRegressor(
@@ -737,8 +760,8 @@ def main():
             fc = pearson(y[va_idx], oof_ix[va_idx])
             print(f"    fold {fold_id}: Pearson={fc:.6f}  best_iter={model.best_iteration_}")
             del model; gc.collect()
-        oof_ix_score = pearson(y, oof_ix)
-        print(f"  With interactions OOF Pearson: {oof_ix_score:.6f}")
+        oof_ix_score = pearson(y[covered_ix], oof_ix[covered_ix])
+        print(f"  With interactions OOF Pearson (covered): {oof_ix_score:.6f}")
         print(f"  Baseline OOF Pearson:          {base_score:.6f}")
         print(f"  Δ: {oof_ix_score - base_score:+.6f}")
         if oof_ix_score > base_score:
@@ -758,7 +781,8 @@ def main():
         print(f"  + Interactions OOF Pearson:      {oof_ix_score:.6f}")
     if oof_cond is not None:
         y = df_train[TARGET_COL].to_numpy(np.float64)
-        print(f"  Conditional (sector) OOF Pearson:{pearson(y, oof_cond):.6f}")
+        cv = oof_valid_mask(len(df_train), splits)
+        print(f"  Conditional (sector) OOF Pearson (covered): {pearson(y[cv], oof_cond[cv]):.6f}")
     print(f"\n  Feature families saved:  {OUT/'feature_families.csv'}")
     print(f"  Fingerprint saved:       {OUT/'surprise_fingerprint.csv'}")
     print(f"  Interactions saved:      {OUT/'interaction_candidates.csv'}")
