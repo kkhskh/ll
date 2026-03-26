@@ -1,17 +1,10 @@
 """
 Advanced experiments: walk-forward CatBoost ablations with honest OOF.
-
-Four controlled CatBoost ablations — same walk-forward splits, one variable at a time:
-  A  raw_features                            meta + anon only
-  B  raw_plus_si_history                     A + si history features
-  C  raw_plus_rank_plus_si_history           B + fold-safe ranks (per-fold top-N anon, train ref per di)
-  D  raw_plus_zscore_plus_rank_plus_si_history  C on z-scored anon (global z still uses full train per di)
-
-Rules:
-  - meta_cols (si, di, industry, sector, top*) are NEVER normalized or ranked
-  - si history is built BEFORE any anonymous transformation
-  - every fold's train di < valid di  (hard-asserted)
-  - LightGBM disabled until ablations are complete (RUN_LGBM = False)
+Parts C/D:
+  - add non-target si context features
+  - evaluate B1/B2/B3 for si feature usefulness
+  - evaluate D1..D7 with full-column unsupervised transforms
+  - fold-local interaction selection only (no full-train target screening)
 """
 from __future__ import annotations
 
@@ -42,7 +35,12 @@ META_COL_CANDIDATES = ["si", "di", "industry", "sector", "top2000", "top1000", "
 N_SPLITS   = 5
 SEED       = 42
 RUN_LGBM   = False   # disabled until CatBoost ablations are complete
-TOP_N_ANON_SELECT = 30  # per-fold for C/D rank experiments (no global target leakage)
+TOP_N_ANON_SELECT = 30
+TOP_FOLD_INTERACTIONS = 20
+DEFAULT_FAMILY_REPS = [
+    "f_118", "f_21", "f_107", "f_53", "f_50", "f_1",
+    "f_35", "f_126", "f_31", "f_120", "f_117", "f_130",
+]
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -208,6 +206,44 @@ def add_forward_safe_si_history(df_train, df_test):
     return df_train_out, df_test_out
 
 
+def add_forward_safe_si_context(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Non-target si context features.
+    Train uses prior rows within each si (ordered by si, di, id); test maps from full train.
+    """
+    tr = df_train.copy().reset_index(drop=True)
+    te = df_test.copy()
+    order = tr.sort_values([STOCK_COL, TIME_COL, ID_COL]).index
+    tr_s = tr.loc[order].copy()
+    tr_s["si_hist_count_ctx"] = tr_s.groupby(STOCK_COL, sort=False).cumcount()
+    tr_s["si_seen_before"] = (tr_s["si_hist_count_ctx"] > 0).astype(np.int8)
+    tr_s["si_log_count"] = np.log1p(tr_s["si_hist_count_ctx"].astype(np.float64))
+    tr_s["si_prev_di"] = tr_s.groupby(STOCK_COL, sort=False)[TIME_COL].shift(1)
+    tr_s["si_prev_gap_di"] = tr_s[TIME_COL].to_numpy(np.float64) - tr_s["si_prev_di"].to_numpy(np.float64)
+    gap_median = float(np.nanmedian(tr_s["si_prev_gap_di"].to_numpy(np.float64)))
+    if not np.isfinite(gap_median):
+        gap_median = 1.0
+    tr_s["si_prev_gap_di"] = tr_s["si_prev_gap_di"].fillna(gap_median)
+    tr_out = df_train.copy()
+    for col in ["si_seen_before", "si_log_count", "si_prev_gap_di"]:
+        tr_out[col] = tr_s[col].reindex(range(len(tr))).values
+
+    full_cnt = df_train.groupby(STOCK_COL).size()
+    full_last_di = df_train.groupby(STOCK_COL)[TIME_COL].max()
+    te_seen = te[STOCK_COL].isin(full_cnt.index).astype(np.int8)
+    te_log = np.log1p(te[STOCK_COL].map(full_cnt).fillna(0).to_numpy(np.float64))
+    te_gap = te[TIME_COL].to_numpy(np.float64) - te[STOCK_COL].map(full_last_di).to_numpy(np.float64)
+    te_gap = np.where(np.isfinite(te_gap), te_gap, gap_median)
+    te_out = df_test.copy()
+    te_out["si_seen_before"] = te_seen
+    te_out["si_log_count"] = te_log
+    te_out["si_prev_gap_di"] = te_gap
+    return tr_out, te_out
+
+
 # ── cross-sectional z-score (anonymous numeric cols only) ─────────────────────
 def cross_sectional_zscore_anonymous(df, anon_numeric_cols, group_col=TIME_COL):
     """
@@ -249,6 +285,87 @@ def add_rank_features(df, rank_source_cols, group_col=TIME_COL, suffix="_csrank"
             out[f"{col}{suffix}"] = grp[col].rank(pct=True, na_option="keep")
     return out
 
+
+def get_sparse_anon_cols(df_train, anon_cols, nan_frac_threshold=0.20):
+    """Anonymous columns with missing fraction >= threshold."""
+    miss = df_train[anon_cols].isna().mean()
+    return [c for c in anon_cols if float(miss.get(c, 0.0)) >= nan_frac_threshold]
+
+
+def add_sparse_indicators(df, sparse_cols):
+    """For each sparse f_x: add _isna, _filled0, _present_x_value."""
+    out = df.copy()
+    for c in sparse_cols:
+        if c not in out.columns:
+            continue
+        filled = out[c].fillna(0.0).astype(np.float32)
+        isna = out[c].isna().astype(np.int8)
+        out[f"{c}_isna"] = isna
+        out[f"{c}_filled0"] = filled
+        out[f"{c}_present_x_value"] = filled * (1.0 - isna.astype(np.float32))
+    return out
+
+
+def build_fold_local_family_interactions(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
+    reps: list[str],
+    top_k: int = TOP_FOLD_INTERACTIONS,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """
+    Fold-local target-aware interaction selection:
+    score candidates on train fold only, keep top-k |Pearson|.
+    """
+    y = df_train[TARGET_COL].to_numpy(np.float64)
+    cands = []
+    for i, a in enumerate(reps):
+        if a not in df_train.columns:
+            continue
+        xa = df_train[a].to_numpy(np.float64)
+        for b in reps[i + 1:]:
+            if b not in df_train.columns:
+                continue
+            xb = df_train[b].to_numpy(np.float64)
+            for kind in ("prod", "diff", "ratio"):
+                if kind == "prod":
+                    v = xa * xb
+                elif kind == "diff":
+                    v = xa - xb
+                else:
+                    v = xa / (1.0 + np.abs(xb))
+                m = np.isfinite(v[tr_idx]) & np.isfinite(y[tr_idx])
+                if int(m.sum()) < 100:
+                    continue
+                r = pearson(y[tr_idx][m], v[tr_idx][m])
+                if np.isfinite(r):
+                    cands.append((abs(r), r, a, b, kind))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    chosen = cands[:top_k]
+
+    tr = df_train.copy()
+    te = df_test.copy()
+    names = []
+    for _, _, a, b, kind in chosen:
+        name = f"ix_{a}_{b}_{kind}"
+        xa_tr = tr[a].to_numpy(np.float64)
+        xb_tr = tr[b].to_numpy(np.float64)
+        xa_te = te[a].to_numpy(np.float64)
+        xb_te = te[b].to_numpy(np.float64)
+        if kind == "prod":
+            v_tr = xa_tr * xb_tr
+            v_te = xa_te * xb_te
+        elif kind == "diff":
+            v_tr = xa_tr - xb_tr
+            v_te = xa_te - xb_te
+        else:
+            v_tr = xa_tr / (1.0 + np.abs(xb_tr))
+            v_te = xa_te / (1.0 + np.abs(xb_te))
+        tr[name] = v_tr
+        te[name] = v_te
+        names.append(name)
+    return tr, te, names
 
 def fold_safe_within_di_rank(
     df: pd.DataFrame,
@@ -376,6 +493,7 @@ def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterat
     covered   = np.zeros(len(df_train), dtype=bool)
     test_pred = np.zeros(len(df_test))
     fold_scores = []
+    best_iters = []
 
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
         # Hard assertion: no future di in train
@@ -409,12 +527,14 @@ def run_catboost(df_train, df_test, feature_cols, splits, meta_cols, tag, iterat
         test_pred   += model.predict(te_cb) / len(splits)
         fc = pearson(y[va_idx], oof[va_idx])
         fold_scores.append(fc)
-        print(f"  [{tag}] fold {fold_id}: Pearson={fc:.6f}  best_iter={model.best_iteration_}")
+        bi = int(model.best_iteration_) if model.best_iteration_ is not None else -1
+        best_iters.append(bi)
+        print(f"  [{tag}] fold {fold_id}: Pearson={fc:.6f}  best_iter={bi}")
         del model; gc.collect()
 
     oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
     print(f"  [{tag}] OOF Pearson (covered only): {oof_score:.6f}  coverage_frac={cov_frac:.4f}")
-    return oof, test_pred, oof_score, fold_scores, cov_frac, covered, len(feat)
+    return oof, test_pred, oof_score, fold_scores, cov_frac, covered, len(feat), best_iters
 
 
 def run_catboost_foldwise_rank_selection(
@@ -511,6 +631,84 @@ def run_catboost_foldwise_rank_selection(
     return oof, test_pred, oof_score, fold_scores, cov_frac, covered, len(feat_cols)
 
 
+def run_catboost_with_fold_local_interactions(
+    df_train_base: pd.DataFrame,
+    df_test_base: pd.DataFrame,
+    base_feat_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    meta_cols: list[str],
+    reps: list[str],
+    tag: str,
+    iterations: int = 3000,
+):
+    from catboost import CatBoostRegressor
+
+    y = df_train_base[TARGET_COL].to_numpy(np.float64)
+    oof = np.zeros(len(df_train_base))
+    covered = np.zeros(len(df_train_base), dtype=bool)
+    test_pred = np.zeros(len(df_test_base))
+    fold_scores = []
+    best_iters = []
+    fold_interactions: dict[str, list[str]] = {}
+    feat_n = None
+
+    for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        tr_di = df_train_base.iloc[tr_idx][TIME_COL]
+        va_di = df_train_base.iloc[va_idx][TIME_COL]
+        assert tr_di.max() < va_di.min(), f"[{tag}] fold {fold_id}: walk-forward violated"
+
+        df_tr, df_te, ix_cols = build_fold_local_family_interactions(
+            df_train_base, df_test_base, tr_idx, va_idx, reps, top_k=TOP_FOLD_INTERACTIONS
+        )
+        fold_interactions[str(fold_id)] = ix_cols
+        feat_cols = [c for c in (base_feat_cols + ix_cols) if c in df_tr.columns and c in df_te.columns]
+        feat_n = len(feat_cols)
+        cat_features = [c for c in meta_cols if c in feat_cols]
+        tr_cb = df_tr[feat_cols].copy()
+        te_cb = df_te[feat_cols].copy()
+        for c in cat_features:
+            tr_cb[c] = tr_cb[c].astype(str)
+            te_cb[c] = te_cb[c].astype(str)
+
+        model = CatBoostRegressor(
+            loss_function="RMSE",
+            eval_metric=PearsonEvalMetric(),
+            depth=6,
+            learning_rate=0.05,
+            iterations=iterations,
+            l2_leaf_reg=3.0,
+            random_seed=SEED + fold_id,
+            subsample=0.8,
+            bootstrap_type="Bernoulli",
+            od_type="Iter",
+            od_wait=300,
+            verbose=False,
+        )
+        model.fit(
+            tr_cb.iloc[tr_idx], y[tr_idx],
+            cat_features=cat_features if cat_features else None,
+            eval_set=(tr_cb.iloc[va_idx], y[va_idx]),
+            use_best_model=True,
+        )
+        oof[va_idx] = model.predict(tr_cb.iloc[va_idx])
+        covered[va_idx] = True
+        test_pred += model.predict(te_cb) / len(splits)
+        fc = pearson(y[va_idx], oof[va_idx])
+        fold_scores.append(fc)
+        bi = int(model.best_iteration_) if model.best_iteration_ is not None else -1
+        best_iters.append(bi)
+        print(
+            f"  [{tag}] fold {fold_id}: Pearson={fc:.6f}  best_iter={bi}  "
+            f"top_ix={len(ix_cols)}"
+        )
+        del model
+        gc.collect()
+
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
+    print(f"  [{tag}] OOF Pearson (covered only): {oof_score:.6f}  coverage_frac={cov_frac:.4f}")
+    return oof, test_pred, oof_score, fold_scores, cov_frac, covered, int(feat_n or 0), best_iters, fold_interactions
+
+
 def make_submission(test_ids, preds, name):
     p = np.asarray(preds, np.float64).copy()
     lo, hi = np.nanpercentile(p, [0.5, 99.5])
@@ -549,21 +747,15 @@ def main():
               f"n_train={len(tr):,}  n_valid={len(va):,}  "
               f"embargo_ok={tr_di.max() < va_di.min()}")
 
-    # ── exploratory: full-train correlations (NOT used to choose C/D rank columns) ─
+    # ── exploratory correlation snapshot ───────────────────────────────────────
     print("\n" + "="*60)
-    print("Exploratory: per-anonymous Pearson on full train (do not use for OOF feature pick)")
+    print("Exploratory: per-anonymous Pearson on full train (diagnostic only)")
     print("="*60)
     df_corr = per_feature_correlation(df_train, anon_numeric_cols)
     df_corr.to_csv(OUTPUT_DIR / "feature_correlations.csv", index=False)
-    print("\nTop 20 anonymous features by |Pearson| (full train, biased for selection):")
     print(df_corr.head(20).to_string(index=False))
-    print(f"\nMax single-feature |Pearson|: {df_corr['corr'].max():.6f}")
-    print(
-        f"\nExperiments C/D use per-fold top-{TOP_N_ANON_SELECT} on train fold only + "
-        "fold-safe ranks (train reference per di).\n"
-    )
 
-    # ── si history — FIRST, on raw data, before any anonymous transform ────────
+    # ── si history + si context on raw data ───────────────────────────────────
     print("\n" + "="*60)
     print("Building forward-safe si history (raw si, before any normalization)")
     print("="*60)
@@ -571,6 +763,7 @@ def main():
     meta_before   = df_train[meta_cols].copy()
 
     df_train_h, df_test_h = add_forward_safe_si_history(df_train, df_test)
+    df_train_ctx, df_test_ctx = add_forward_safe_si_context(df_train_h, df_test_h)
 
     # Proof assertions
     assert df_train_h[STOCK_COL].reset_index(drop=True).equals(
@@ -584,51 +777,41 @@ def main():
     print("  ✓ All meta columns unchanged after si-history build")
 
     hist_cols = ["si_hist_count", "si_hist_mean", "si_last_target", "si_hist_std"]
+    ctx_cols = ["si_seen_before", "si_log_count", "si_prev_gap_di"]
+    base_cols = meta_cols + anon_cols
 
-    # ── build the three transformed variants ──────────────────────────────────
-    # zscore anon only
-    df_train_z  = cross_sectional_zscore_anonymous(df_train_h, anon_numeric_cols)
-    df_test_z   = cross_sectional_zscore_anonymous(df_test_h,  anon_numeric_cols)
+    # ── unsupervised transforms over ALL anon numeric cols ────────────────────
+    df_train_rank = add_rank_features(df_train_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
+    df_test_rank = add_rank_features(df_test_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
+    rank_cols = [f"{c}_csrank" for c in anon_numeric_cols if f"{c}_csrank" in df_train_rank.columns]
+    df_train_z = cross_sectional_zscore_anonymous(df_train_ctx, anon_numeric_cols)
+    df_test_z = cross_sectional_zscore_anonymous(df_test_ctx, anon_numeric_cols)
+    z_cols = anon_numeric_cols
 
-    # Proof: meta cols untouched by z-score
-    for col in meta_cols:
-        assert df_train_z[col].reset_index(drop=True).equals(
-            df_train_h[col].reset_index(drop=True)
-        ), f"Z-score mutated meta column: {col}"
-    print("  ✓ Meta columns unchanged after cross-sectional z-score")
-    print(
-        "  Note: D still applies global within-di z-score on full train before folds — "
-        "that uses future rows in the same di; only rank+top-N selection was fold-fixed here.\n"
-    )
+    sparse_cols = get_sparse_anon_cols(df_train_ctx, anon_cols, nan_frac_threshold=0.20)
+    df_train_sparse = add_sparse_indicators(df_train_ctx, sparse_cols)
+    df_test_sparse = add_sparse_indicators(df_test_ctx, sparse_cols)
+    sparse_derived = []
+    for c in sparse_cols:
+        sparse_derived.extend([f"{c}_isna", f"{c}_filled0", f"{c}_present_x_value"])
 
-    # ── experiment definitions ─────────────────────────────────────────────────
+    reps = [c for c in DEFAULT_FAMILY_REPS if c in anon_cols]
+    print(f"  sparse anonymous cols (>=20% NaN): {len(sparse_cols)}")
+    print(f"  family representatives for fold-local interactions: {reps}")
+
+    # ── experiment definitions (Parts C + D) ──────────────────────────────────
     experiments = [
-        {
-            "name":          "A_raw_features",
-            "foldwise_rank": False,
-            "df_tr":         df_train_h,
-            "df_te":         df_test_h,
-            "feat":          meta_cols + anon_cols,
-        },
-        {
-            "name":          "B_raw_plus_si_history",
-            "foldwise_rank": False,
-            "df_tr":         df_train_h,
-            "df_te":         df_test_h,
-            "feat":          meta_cols + anon_cols + hist_cols,
-        },
-        {
-            "name":          "C_raw_plus_rank_plus_si_history",
-            "foldwise_rank": True,
-            "df_tr":         df_train_h,
-            "df_te":         df_test_h,
-        },
-        {
-            "name":          "D_raw_plus_zscore_plus_rank_plus_si_history",
-            "foldwise_rank": True,
-            "df_tr":         df_train_z,
-            "df_te":         df_test_z,
-        },
+        {"name": "A_raw_features", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
+        {"name": "B1_raw_plus_si_context", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + ctx_cols},
+        {"name": "B2_raw_plus_target_history_audit", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + hist_cols},
+        {"name": "B3_raw_plus_si_context_plus_target_history_audit", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + ctx_cols + hist_cols},
+        {"name": "D1_raw", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
+        {"name": "D2_raw_plus_allrank", "mode": "plain", "df_tr": df_train_rank, "df_te": df_test_rank, "feat": base_cols + rank_cols},
+        {"name": "D3_raw_plus_allz", "mode": "plain", "df_tr": df_train_z, "df_te": df_test_z, "feat": base_cols + z_cols},
+        {"name": "D4_raw_plus_rank_plus_z", "mode": "plain", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z"), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z"), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols]},
+        {"name": "D5_raw_plus_sparseflags", "mode": "plain", "df_tr": df_train_sparse, "df_te": df_test_sparse, "feat": base_cols + sparse_derived},
+        {"name": "D6_raw_plus_rank_plus_z_plus_sparseflags", "mode": "plain", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z").join(df_train_sparse[sparse_derived]), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z").join(df_test_sparse[sparse_derived]), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols] + sparse_derived},
+        {"name": "D7_raw_plus_rank_plus_z_plus_sparseflags_plus_fold_interactions", "mode": "fold_interactions", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z").join(df_train_sparse[sparse_derived]), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z").join(df_test_sparse[sparse_derived]), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols] + sparse_derived},
     ]
 
     y = df_train[TARGET_COL].to_numpy(np.float64)
@@ -640,19 +823,17 @@ def main():
         print(f"EXPERIMENT {exp['name']}")
         print("="*60)
 
-        if exp.get("foldwise_rank"):
-            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat = (
-                run_catboost_foldwise_rank_selection(
-                    exp["df_tr"], exp["df_te"], splits,
-                    meta_cols, anon_cols, anon_numeric_cols, hist_cols,
-                    tag=exp["name"][:25],
+        if exp["mode"] == "fold_interactions":
+            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat, best_iters, fold_ix = (
+                run_catboost_with_fold_local_interactions(
+                    exp["df_tr"], exp["df_te"], exp["feat"], splits, meta_cols, reps, tag=exp["name"][:25]
                 )
             )
-            print(f"  feature count: {n_feat} (meta+anon+hist+union rank_*; foldwise top-{TOP_N_ANON_SELECT})")
+            (OUTPUT_DIR / f"fold_interactions_{exp['name']}.json").write_text(json.dumps(fold_ix, indent=2))
         else:
             feat_cols = [c for c in exp["feat"] if c in exp["df_tr"].columns]
             print(f"  feature count: {len(feat_cols)}")
-            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat = run_catboost(
+            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat, best_iters = run_catboost(
                 exp["df_tr"], exp["df_te"], feat_cols, splits, meta_cols,
                 tag=exp["name"][:25],
             )
@@ -670,10 +851,13 @@ def main():
             "n_features":  n_feat,
             "oof_pearson": round(oof_score, 6),
             "oof_coverage_frac": round(cov_frac, 6),
-            "foldwise_rank_selection": exp.get("foldwise_rank", False),
+            "foldwise_rank_selection": False,
+            "mean_best_iter": float(np.nanmean(best_iters)) if len(best_iters) else float("nan"),
         }
         for i, s in enumerate(fold_scores):
             row[f"fold_{i}"] = round(s, 6)
+        for i, bi in enumerate(best_iters):
+            row[f"best_iter_{i}"] = int(bi)
         results_rows.append(row)
 
         if best_exp is None or oof_score > best_exp["oof_score"]:
@@ -691,6 +875,18 @@ def main():
     print("EXPERIMENT SUMMARY (sorted by OOF Pearson)")
     print("="*60)
     print(df_results.to_string(index=False))
+    a_score = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "A_raw_features"), np.nan)
+    if np.isfinite(a_score):
+        promoted = [r["experiment"] for r in results_rows if (r["oof_pearson"] - a_score) >= 0.002]
+        print(f"\nPromotion rule (+0.002 vs A): {promoted if promoted else 'none'}")
+    b1 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B1_raw_plus_si_context"), np.nan)
+    b2 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B2_raw_plus_target_history_audit"), np.nan)
+    b3 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B3_raw_plus_si_context_plus_target_history_audit"), np.nan)
+    if np.isfinite(a_score) and np.isfinite(b1):
+        print("Decision B1 vs A:", "drop si engineered mainline" if b1 <= a_score else "keep si context in research")
+    if np.isfinite(a_score) and (np.isfinite(b2) or np.isfinite(b3)):
+        if (np.isfinite(b2) and b2 < a_score) or (np.isfinite(b3) and b3 < a_score):
+            print("Decision B2/B3: archive target-history (no mainline use)")
 
     print(
         f"\n→ Best experiment: {best_exp['name']}  "

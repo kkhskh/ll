@@ -21,6 +21,7 @@ TARGET_COL = "target"
 PRIMARY_TIME_COL = "di"
 PRIMARY_GROUP_COL = "si"
 META_COLS = ["si", "di", "industry", "sector", "top2000", "top1000", "top500"]
+BASELINE_OUTPUT_DIR = Path("artifacts")
 
 
 @contextmanager
@@ -291,6 +292,167 @@ def summarize_splits(
     return rows
 
 
+def audit_si_utility(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+) -> dict[str, object]:
+    """Audit whether stock id (`si`) carries usable temporal signal."""
+    out_dir = BASELINE_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train_si = set(df_train[PRIMARY_GROUP_COL].dropna().unique())
+    test_si = set(df_test[PRIMARY_GROUP_COL].dropna().unique())
+    inter = train_si & test_si
+    test_si_unique = max(len(test_si), 1)
+    test_rows_seen = df_test[PRIMARY_GROUP_COL].isin(train_si).to_numpy()
+
+    obs_per_si = df_train.groupby(PRIMARY_GROUP_COL).size().astype(int)
+    quantiles = obs_per_si.quantile([0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]).to_dict()
+    dist = {
+        "count": float(obs_per_si.shape[0]),
+        "mean": float(obs_per_si.mean()),
+        "std": float(obs_per_si.std()),
+        "min": float(obs_per_si.min()),
+        "p01": float(quantiles.get(0.01, np.nan)),
+        "p05": float(quantiles.get(0.05, np.nan)),
+        "p10": float(quantiles.get(0.10, np.nan)),
+        "p25": float(quantiles.get(0.25, np.nan)),
+        "p50": float(quantiles.get(0.50, np.nan)),
+        "p75": float(quantiles.get(0.75, np.nan)),
+        "p90": float(quantiles.get(0.90, np.nan)),
+        "p95": float(quantiles.get(0.95, np.nan)),
+        "p99": float(quantiles.get(0.99, np.nan)),
+        "max": float(obs_per_si.max()),
+        "stocks_ge_1": int((obs_per_si >= 1).sum()),
+        "stocks_ge_2": int((obs_per_si >= 2).sum()),
+        "stocks_ge_4": int((obs_per_si >= 4).sum()),
+        "stocks_ge_8": int((obs_per_si >= 8).sum()),
+        "stocks_ge_12": int((obs_per_si >= 12).sum()),
+    }
+    pd.DataFrame(
+        [{"metric": k, "value": v} for k, v in dist.items()]
+    ).to_csv(out_dir / "si_obs_distribution.csv", index=False)
+
+    # Forward-safe persistence on raw target + cross-sectional target.
+    ord_train = df_train.sort_values([PRIMARY_GROUP_COL, PRIMARY_TIME_COL, ID_COL]).copy()
+    ord_train["lag1_target"] = ord_train.groupby(PRIMARY_GROUP_COL, sort=False)[TARGET_COL].shift(1)
+    ord_train["lag2_target"] = ord_train.groupby(PRIMARY_GROUP_COL, sort=False)[TARGET_COL].shift(2)
+    valid1 = ord_train["lag1_target"].notna().to_numpy()
+    valid2 = ord_train["lag2_target"].notna().to_numpy()
+    y = ord_train[TARGET_COL].to_numpy(np.float64)
+    lag1 = ord_train["lag1_target"].to_numpy(np.float64)
+    lag2 = ord_train["lag2_target"].to_numpy(np.float64)
+
+    raw_persist = {
+        "corr_target_lag1": pearson_corr(y[valid1], lag1[valid1]) if int(valid1.sum()) >= 2 else float("nan"),
+        "corr_target_lag2": pearson_corr(y[valid2], lag2[valid2]) if int(valid2.sum()) >= 2 else float("nan"),
+        "corr_abs_target_abs_lag1": (
+            pearson_corr(np.abs(y[valid1]), np.abs(lag1[valid1])) if int(valid1.sum()) >= 2 else float("nan")
+        ),
+        "sign_agreement_lag1": (
+            float((np.sign(y[valid1]) == np.sign(lag1[valid1])).mean()) if int(valid1.sum()) else float("nan")
+        ),
+    }
+
+    cs_mean = ord_train.groupby(PRIMARY_TIME_COL)[TARGET_COL].transform("mean")
+    ord_train["target_cs"] = ord_train[TARGET_COL] - cs_mean
+    ord_train["lag1_target_cs"] = ord_train.groupby(PRIMARY_GROUP_COL, sort=False)["target_cs"].shift(1)
+    ord_train["lag2_target_cs"] = ord_train.groupby(PRIMARY_GROUP_COL, sort=False)["target_cs"].shift(2)
+    v1 = ord_train["lag1_target_cs"].notna().to_numpy()
+    v2 = ord_train["lag2_target_cs"].notna().to_numpy()
+    y_cs = ord_train["target_cs"].to_numpy(np.float64)
+    lag1_cs = ord_train["lag1_target_cs"].to_numpy(np.float64)
+    lag2_cs = ord_train["lag2_target_cs"].to_numpy(np.float64)
+    cs_persist = {
+        "corr_target_lag1": pearson_corr(y_cs[v1], lag1_cs[v1]) if int(v1.sum()) >= 2 else float("nan"),
+        "corr_target_lag2": pearson_corr(y_cs[v2], lag2_cs[v2]) if int(v2.sum()) >= 2 else float("nan"),
+        "corr_abs_target_abs_lag1": (
+            pearson_corr(np.abs(y_cs[v1]), np.abs(lag1_cs[v1])) if int(v1.sum()) >= 2 else float("nan")
+        ),
+        "sign_agreement_lag1": (
+            float((np.sign(y_cs[v1]) == np.sign(lag1_cs[v1])).mean()) if int(v1.sum()) else float("nan")
+        ),
+    }
+
+    y_train = df_train[TARGET_COL].to_numpy(np.float64)
+    fold_rows: list[dict[str, object]] = []
+    print("\nsi fold utility (walk-forward):")
+    print(
+        f"{'fold':>4}  {'valid_rows':>10}  {'seen_frac':>9}  {'count_ge_2':>10}  "
+        f"{'si_mean_corr':>12}  {'si_log_count_corr':>16}"
+    )
+    for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        tr = df_train.iloc[tr_idx]
+        va = df_train.iloc[va_idx]
+        tr_y = y_train[tr_idx]
+        tr_global = float(np.mean(tr_y))
+        si_mean = tr.groupby(PRIMARY_GROUP_COL)[TARGET_COL].mean()
+        si_count = tr.groupby(PRIMARY_GROUP_COL).size()
+        va_si = va[PRIMARY_GROUP_COL]
+        va_mean_pred = va_si.map(si_mean).fillna(tr_global).to_numpy(np.float64)
+        va_count_pred = va_si.map(np.log1p(si_count)).fillna(0.0).to_numpy(np.float64)
+        seen_mask = va_si.isin(si_mean.index).to_numpy()
+        ge2_mask = va_si.map(si_count).fillna(0).to_numpy() >= 2
+        mean_corr = pearson_corr(y_train[va_idx], va_mean_pred)
+        cnt_corr = pearson_corr(y_train[va_idx], va_count_pred)
+        row = {
+            "fold": fold_id,
+            "valid_rows": int(len(va_idx)),
+            "seen_frac": float(seen_mask.mean()),
+            "count_ge_2_frac": float(ge2_mask.mean()),
+            "si_mean_encode_corr": mean_corr,
+            "si_log_count_corr": cnt_corr,
+            "global_mean_baseline_corr": 0.0,
+            "si_mean_minus_global_baseline": (mean_corr - 0.0) if np.isfinite(mean_corr) else float("nan"),
+        }
+        fold_rows.append(row)
+        print(
+            f"{fold_id:>4}  {len(va_idx):>10,}  {row['seen_frac']:>9.4f}  {row['count_ge_2_frac']:>10.4f}  "
+            f"{mean_corr:>12.6f}  {cnt_corr:>16.6f}"
+        )
+
+    pd.DataFrame(fold_rows).to_csv(out_dir / "si_fold_coverage.csv", index=False)
+
+    mean_gain = float(np.nanmean([r["si_mean_minus_global_baseline"] for r in fold_rows]))
+    lag_strength = np.nanmean(
+        [
+            np.abs(raw_persist["corr_target_lag1"]),
+            np.abs(raw_persist["corr_target_lag2"]),
+            np.abs(cs_persist["corr_target_lag1"]),
+            np.abs(cs_persist["corr_target_lag2"]),
+        ]
+    )
+    dead_end = bool((mean_gain < 0.002) and (lag_strength < 0.01))
+    decision_note = (
+        "si target-history appears weak: do not prioritize si target-history for mainline alpha."
+        if dead_end
+        else "si shows measurable persistence and/or fold-safe utility: keep selective si work in research."
+    )
+    print(f"\nSI decision note: {decision_note}")
+
+    payload = {
+        "global_overlap": {
+            "train_si_unique": int(len(train_si)),
+            "test_si_unique": int(len(test_si)),
+            "global_test_si_seen_frac": float(len(inter) / test_si_unique),
+            "test_rows_seen_si_frac": float(test_rows_seen.mean()),
+        },
+        "obs_per_si_distribution": dist,
+        "target_persistence_raw": raw_persist,
+        "target_persistence_cross_sectional": cs_persist,
+        "fold_utility": fold_rows,
+        "decision": {
+            "mean_si_mean_encode_gain_vs_global_baseline": mean_gain,
+            "lag_persistence_strength_abs_mean": float(lag_strength),
+            "dead_end_for_mainline_alpha": dead_end,
+            "note": decision_note,
+        },
+    }
+    (out_dir / "si_audit.json").write_text(json.dumps(payload, indent=2))
+    return payload
+
+
 def evaluate_linear_model(
     df_train: pd.DataFrame,
     cols: list[str],
@@ -508,6 +670,8 @@ def ensure_output_dir(path_str: str) -> Path:
 def main() -> None:
     args = parse_args()
     output_dir = ensure_output_dir(args.output_dir)
+    global BASELINE_OUTPUT_DIR
+    BASELINE_OUTPUT_DIR = output_dir
 
     df_train, df_test = load_data(args.train_path, args.test_path)
     all_cols = feature_columns(df_train)
@@ -527,6 +691,7 @@ def main() -> None:
 
     primary_strategy = "walk_forward_di"
     primary_splits = strategy_splits[primary_strategy]
+    si_audit = audit_si_utility(df_train, df_test, primary_splits)
 
     # ── fold diagnostics ──────────────────────────────────────────────────────
     fold_diagnostics = summarize_splits(df_train, primary_splits)
@@ -624,6 +789,7 @@ def main() -> None:
         "walk_forward_fold_diagnostics": fold_diagnostics,
         "cv_strategy_results": strategy_results,
         "feature_group_results": grouped_results,
+        "si_audit": si_audit,
         "linear_primary_strategy": {
             "strategy": primary_strategy,
             "oof_corr": linear_primary["oof_corr"],
