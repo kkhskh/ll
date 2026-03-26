@@ -261,9 +261,11 @@ def cross_sectional_zscore_anonymous(df, anon_numeric_cols, group_col=TIME_COL):
     for g in np.unique(groups):
         mask  = groups == g
         sub   = arr[mask]
-        mu    = np.nanmean(sub, axis=0)
-        sigma = np.nanstd(sub, axis=0)
-        sigma[sigma == 0] = 1.0
+        with np.errstate(invalid="ignore"):
+            mu = np.nanmean(sub, axis=0)
+            sigma = np.nanstd(sub, axis=0)
+        mu = np.where(np.isfinite(mu), mu, 0.0)
+        sigma = np.where(np.isfinite(sigma) & (sigma != 0), sigma, 1.0)
         result[mask] = (sub - mu) / (sigma + 1e-8)
 
     out[f_cols] = result.astype(np.float32)
@@ -709,6 +711,440 @@ def run_catboost_with_fold_local_interactions(
     return oof, test_pred, oof_score, fold_scores, cov_frac, covered, int(feat_n or 0), best_iters, fold_interactions
 
 
+def _prepare_d7_fold_dataset(
+    df_train_base: pd.DataFrame,
+    df_test_base: pd.DataFrame,
+    base_feat_cols: list[str],
+    meta_cols: list[str],
+    reps: list[str],
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
+):
+    """Build one fold's D7 train/valid/test matrices with fold-local interactions."""
+    df_aug_tr, df_aug_te, ix_cols = build_fold_local_family_interactions(
+        df_train_base, df_test_base, tr_idx, va_idx, reps, top_k=TOP_FOLD_INTERACTIONS
+    )
+    feat_cols = [c for c in (base_feat_cols + ix_cols) if c in df_aug_tr.columns and c in df_aug_te.columns]
+    cat_cols = [c for c in meta_cols if c in feat_cols and c != TIME_COL]
+    num_cols = [
+        c for c in feat_cols
+        if c not in cat_cols and pd.api.types.is_numeric_dtype(df_aug_tr[c])
+    ]
+
+    tr_df = df_aug_tr.iloc[tr_idx][feat_cols].copy()
+    va_df = df_aug_tr.iloc[va_idx][feat_cols].copy()
+    te_df = df_aug_te[feat_cols].copy()
+    for c in cat_cols:
+        tr_df[c] = tr_df[c].astype(str)
+        va_df[c] = va_df[c].astype(str)
+        te_df[c] = te_df[c].astype(str)
+    return {
+        "train_df": tr_df,
+        "valid_df": va_df,
+        "test_df": te_df,
+        "feat_cols": feat_cols,
+        "cat_cols": cat_cols,
+        "num_cols": num_cols,
+        "ix_cols": ix_cols,
+    }
+
+
+def _fit_numeric_preprocessor(
+    X_tr: pd.DataFrame,
+    X_va: pd.DataFrame,
+    X_te: pd.DataFrame,
+    standardize: bool = False,
+):
+    """Fold-local median impute and optional standardize."""
+    med = X_tr.median(axis=0, numeric_only=True).fillna(0.0)
+    Xtr = X_tr.fillna(med).fillna(0.0)
+    Xva = X_va.fillna(med).fillna(0.0)
+    Xte = X_te.fillna(med).fillna(0.0)
+    if not standardize:
+        return Xtr, Xva, Xte
+    mu = Xtr.mean(axis=0).fillna(0.0)
+    sd = Xtr.std(axis=0).replace(0, 1.0).fillna(1.0)
+    return (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
+
+
+def run_catboost_bagged_d7(
+    df_train_base: pd.DataFrame,
+    df_test_base: pd.DataFrame,
+    base_feat_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    meta_cols: list[str],
+    reps: list[str],
+):
+    """Bagged CatBoost over the fixed D7 representation."""
+    from catboost import CatBoostRegressor
+
+    configs = {
+        "A": {"depth": 5, "learning_rate": 0.02, "l2_leaf_reg": 12.0, "subsample": 0.7},
+        "B": {"depth": 6, "learning_rate": 0.03, "l2_leaf_reg": 8.0, "subsample": 0.8},
+        "C": {"depth": 8, "learning_rate": 0.02, "l2_leaf_reg": 12.0, "subsample": 0.8},
+    }
+    seeds = [42, 52, 62, 72]
+    y = df_train_base[TARGET_COL].to_numpy(np.float64)
+    covered = np.zeros(len(df_train_base), dtype=bool)
+    for _, va_idx in splits:
+        covered[va_idx] = True
+
+    oof_runs = []
+    test_runs = []
+    fold_interactions_all: dict[str, dict[str, list[str]]] = {}
+    best_iters_all: list[int] = []
+
+    for cfg_name, cfg in configs.items():
+        for seed in seeds:
+            tag = f"D7_cb_{cfg_name}_s{seed}"
+            oof = np.zeros(len(df_train_base), dtype=np.float64)
+            test_pred = np.zeros(len(df_test_base), dtype=np.float64)
+            fold_interactions_all[tag] = {}
+            print(f"\nRunning {tag}")
+            for fold_id, (tr_idx, va_idx) in enumerate(splits):
+                fold = _prepare_d7_fold_dataset(
+                    df_train_base, df_test_base, base_feat_cols, meta_cols, reps, tr_idx, va_idx
+                )
+                fold_interactions_all[tag][str(fold_id)] = fold["ix_cols"]
+                model = CatBoostRegressor(
+                    loss_function="RMSE",
+                    eval_metric=PearsonEvalMetric(),
+                    depth=cfg["depth"],
+                    learning_rate=cfg["learning_rate"],
+                    iterations=3000,
+                    l2_leaf_reg=cfg["l2_leaf_reg"],
+                    random_seed=seed + fold_id,
+                    subsample=cfg["subsample"],
+                    bootstrap_type="Bernoulli",
+                    od_type="Iter",
+                    od_wait=300,
+                    verbose=False,
+                )
+                model.fit(
+                    fold["train_df"], y[tr_idx],
+                    cat_features=fold["cat_cols"] if fold["cat_cols"] else None,
+                    eval_set=(fold["valid_df"], y[va_idx]),
+                    use_best_model=True,
+                )
+                p_va = model.predict(fold["valid_df"])
+                oof[va_idx] = p_va
+                test_pred += model.predict(fold["test_df"]) / len(splits)
+                bi = int(model.best_iteration_) if model.best_iteration_ is not None else -1
+                best_iters_all.append(bi)
+                print(f"  [{tag}] fold {fold_id}: Pearson={pearson(y[va_idx], p_va):.6f}  best_iter={bi}")
+                del model
+                gc.collect()
+            oof_runs.append(oof)
+            test_runs.append(test_pred)
+
+    oof_avg = np.mean(np.stack(oof_runs, axis=0), axis=0)
+    test_avg = np.mean(np.stack(test_runs, axis=0), axis=0)
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
+    pd.DataFrame({
+        "oof_pred": oof_avg,
+        "target": y,
+        "oof_covered": covered.astype(np.int8),
+    }).to_csv(OUTPUT_DIR / "oof_D7_cb_bag.csv", index=False)
+    make_submission(df_test_base[ID_COL], test_avg, "D7_cb_bag")
+    (OUTPUT_DIR / "D7_cb_bag_fold_interactions.json").write_text(json.dumps(fold_interactions_all, indent=2))
+    return {
+        "model_name": "D7_cb_bag",
+        "oof_pred": oof_avg,
+        "test_pred": test_avg,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test_base[ID_COL].to_numpy(),
+        "mean_best_iter_or_epochs": float(np.mean(best_iters_all)) if best_iters_all else float("nan"),
+    }
+
+
+def run_extratrees_d7(
+    df_train_base: pd.DataFrame,
+    df_test_base: pd.DataFrame,
+    base_feat_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    meta_cols: list[str],
+    reps: list[str],
+):
+    """ExtraTrees on numeric-only D7 features with fold-local median imputation."""
+    from sklearn.ensemble import ExtraTreesRegressor
+
+    settings = [(42, 0.2), (52, 0.2), (42, 0.4), (52, 0.4)]
+    y = df_train_base[TARGET_COL].to_numpy(np.float64)
+    covered = np.zeros(len(df_train_base), dtype=bool)
+    for _, va_idx in splits:
+        covered[va_idx] = True
+
+    oof_runs = []
+    test_runs = []
+    for seed, max_features in settings:
+        tag = f"D7_et_s{seed}_mf{max_features}"
+        oof = np.zeros(len(df_train_base), dtype=np.float64)
+        test_pred = np.zeros(len(df_test_base), dtype=np.float64)
+        print(f"\nRunning {tag}")
+        for fold_id, (tr_idx, va_idx) in enumerate(splits):
+            fold = _prepare_d7_fold_dataset(
+                df_train_base, df_test_base, base_feat_cols, meta_cols, reps, tr_idx, va_idx
+            )
+            Xtr, Xva, Xte = _fit_numeric_preprocessor(
+                fold["train_df"][fold["num_cols"]],
+                fold["valid_df"][fold["num_cols"]],
+                fold["test_df"][fold["num_cols"]],
+                standardize=False,
+            )
+            model = ExtraTreesRegressor(
+                n_estimators=1000,
+                min_samples_leaf=20,
+                bootstrap=True,
+                max_features=max_features,
+                random_state=seed + fold_id,
+                n_jobs=-1,
+            )
+            model.fit(Xtr, y[tr_idx])
+            p_va = model.predict(Xva)
+            oof[va_idx] = p_va
+            test_pred += model.predict(Xte) / len(splits)
+            print(f"  [{tag}] fold {fold_id}: Pearson={pearson(y[va_idx], p_va):.6f}")
+            del model
+            gc.collect()
+        oof_runs.append(oof)
+        test_runs.append(test_pred)
+
+    oof_avg = np.mean(np.stack(oof_runs, axis=0), axis=0)
+    test_avg = np.mean(np.stack(test_runs, axis=0), axis=0)
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
+    pd.DataFrame({
+        "oof_pred": oof_avg,
+        "target": y,
+        "oof_covered": covered.astype(np.int8),
+    }).to_csv(OUTPUT_DIR / "oof_D7_et.csv", index=False)
+    make_submission(df_test_base[ID_COL], test_avg, "D7_et")
+    return {
+        "model_name": "D7_et",
+        "oof_pred": oof_avg,
+        "test_pred": test_avg,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test_base[ID_COL].to_numpy(),
+        "mean_best_iter_or_epochs": 1000.0,
+    }
+
+
+def run_mlp_d7(
+    df_train_base: pd.DataFrame,
+    df_test_base: pd.DataFrame,
+    base_feat_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    meta_cols: list[str],
+    reps: list[str],
+):
+    """Small D7 MLP on numeric-only features with early stopping on validation Pearson."""
+    try:
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+    except ImportError as exc:
+        raise RuntimeError("run_mlp_d7 requires torch to be installed.") from exc
+
+    class MLP(nn.Module):
+        def __init__(self, in_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 512),
+                nn.ReLU(),
+                nn.Dropout(0.20),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(0.20),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Dropout(0.20),
+                nn.Linear(128, 1),
+            )
+
+        def forward(self, x):
+            return self.net(x).squeeze(-1)
+
+    def predict_array(model, arr: np.ndarray, batch_size: int = 4096) -> np.ndarray:
+        preds = []
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, len(arr), batch_size):
+                batch = torch.tensor(arr[start:start + batch_size], dtype=torch.float32, device=device)
+                preds.append(model(batch).detach().cpu().numpy().astype(np.float64))
+        return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float64)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    y = df_train_base[TARGET_COL].to_numpy(np.float64)
+    covered = np.zeros(len(df_train_base), dtype=bool)
+    for _, va_idx in splits:
+        covered[va_idx] = True
+
+    oof_runs = []
+    test_runs = []
+    epoch_hist: list[int] = []
+    for seed in [42, 52]:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        tag = f"D7_mlp_s{seed}"
+        oof = np.zeros(len(df_train_base), dtype=np.float64)
+        test_pred = np.zeros(len(df_test_base), dtype=np.float64)
+        print(f"\nRunning {tag}")
+        for fold_id, (tr_idx, va_idx) in enumerate(splits):
+            fold = _prepare_d7_fold_dataset(
+                df_train_base, df_test_base, base_feat_cols, meta_cols, reps, tr_idx, va_idx
+            )
+            Xtr, Xva, Xte = _fit_numeric_preprocessor(
+                fold["train_df"][fold["num_cols"]],
+                fold["valid_df"][fold["num_cols"]],
+                fold["test_df"][fold["num_cols"]],
+                standardize=True,
+            )
+            Xtr_np = Xtr.to_numpy(np.float32)
+            Xva_np = Xva.to_numpy(np.float32)
+            Xte_np = Xte.to_numpy(np.float32)
+            ytr_np = y[tr_idx].astype(np.float32)
+            yva = y[va_idx]
+
+            loader = DataLoader(
+                TensorDataset(
+                    torch.tensor(Xtr_np, dtype=torch.float32),
+                    torch.tensor(ytr_np, dtype=torch.float32),
+                ),
+                batch_size=1024,
+                shuffle=True,
+            )
+            model = MLP(Xtr_np.shape[1]).to(device)
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            loss_fn = nn.MSELoss()
+            best_state = None
+            best_score = -1e9
+            best_epoch = 0
+            bad_epochs = 0
+
+            for epoch in range(1, 81):
+                model.train()
+                for xb, yb in loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    opt.zero_grad()
+                    loss = loss_fn(model(xb), yb)
+                    loss.backward()
+                    opt.step()
+                p_va = predict_array(model, Xva_np)
+                score = pearson(yva, p_va)
+                if np.isfinite(score) and score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    bad_epochs = 0
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                else:
+                    bad_epochs += 1
+                if bad_epochs >= 10:
+                    break
+
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            p_va = predict_array(model, Xva_np)
+            p_te = predict_array(model, Xte_np)
+            oof[va_idx] = p_va
+            test_pred += p_te / len(splits)
+            epoch_hist.append(best_epoch)
+            print(f"  [{tag}] fold {fold_id}: Pearson={pearson(y[va_idx], p_va):.6f}  best_epoch={best_epoch}")
+            del model
+            gc.collect()
+        oof_runs.append(oof)
+        test_runs.append(test_pred)
+
+    oof_avg = np.mean(np.stack(oof_runs, axis=0), axis=0)
+    test_avg = np.mean(np.stack(test_runs, axis=0), axis=0)
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
+    pd.DataFrame({
+        "oof_pred": oof_avg,
+        "target": y,
+        "oof_covered": covered.astype(np.int8),
+    }).to_csv(OUTPUT_DIR / "oof_D7_mlp.csv", index=False)
+    make_submission(df_test_base[ID_COL], test_avg, "D7_mlp")
+    return {
+        "model_name": "D7_mlp",
+        "oof_pred": oof_avg,
+        "test_pred": test_avg,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test_base[ID_COL].to_numpy(),
+        "mean_best_iter_or_epochs": float(np.mean(epoch_hist)) if epoch_hist else float("nan"),
+    }
+
+
+def blend_predictions(model_results: list[dict[str, object]]):
+    """Blend model predictions with convex weight grid-search on covered-row z-scored OOF."""
+    if not model_results:
+        raise ValueError("No model results provided for blending.")
+    y = model_results[0]["target"] if "target" in model_results[0] else None
+    covered = np.asarray(model_results[0]["covered"], dtype=bool)
+    if y is None:
+        raise ValueError("Model results must include target for blending.")
+
+    z_oof: dict[str, np.ndarray] = {}
+    z_test: dict[str, np.ndarray] = {}
+    for mr in model_results:
+        name = str(mr["model_name"])
+        oof = np.asarray(mr["oof_pred"], np.float64)
+        test = np.asarray(mr["test_pred"], np.float64)
+        mu = float(np.nanmean(oof[covered]))
+        sd = float(np.nanstd(oof[covered]))
+        if (not np.isfinite(sd)) or sd == 0:
+            sd = 1.0
+        z_oof[name] = (oof - mu) / sd
+        z_test[name] = (test - mu) / sd
+
+    names = [str(mr["model_name"]) for mr in model_results]
+    best_score = -1e9
+    best_weights = None
+    best_test = None
+    best_oof = None
+    grid = np.arange(0.0, 1.0001, 0.05)
+    for weights in np.array(np.meshgrid(*([grid] * len(names)))).T.reshape(-1, len(names)):
+        if abs(float(weights.sum()) - 1.0) > 1e-9:
+            continue
+        oof_bl = np.zeros_like(next(iter(z_oof.values())))
+        te_bl = np.zeros_like(next(iter(z_test.values())))
+        for w, name in zip(weights, names):
+            oof_bl += float(w) * z_oof[name]
+            te_bl += float(w) * z_test[name]
+        score = pearson(y[covered], oof_bl[covered])
+        if np.isfinite(score) and score > best_score:
+            best_score = score
+            best_weights = {name: float(w) for name, w in zip(names, weights)}
+            best_test = te_bl
+            best_oof = oof_bl.copy()
+
+    if best_weights is None or best_test is None or best_oof is None:
+        raise RuntimeError("Blend search failed.")
+    make_submission(model_results[0]["test_ids"], best_test, "D7_blend")
+    (OUTPUT_DIR / "blend_weights.json").write_text(
+        json.dumps({"weights": best_weights, "oof_pearson": best_score}, indent=2)
+    )
+    return {
+        "model_name": "D7_blend",
+        "oof_pred": best_oof,
+        "test_pred": best_test,
+        "oof_corr": float(best_score),
+        "coverage_frac": float(covered.mean()),
+        "covered": covered,
+        "target": y,
+        "test_ids": model_results[0]["test_ids"],
+        "weights": best_weights,
+        "mean_best_iter_or_epochs": float("nan"),
+    }
+
+
 def make_submission(test_ids, preds, name):
     p = np.asarray(preds, np.float64).copy()
     lo, hi = np.nanpercentile(p, [0.5, 99.5])
@@ -731,12 +1167,10 @@ def main():
     df_test  = pd.read_csv(TEST_PATH)
     print(f"  train: {df_train.shape}  test: {df_test.shape}")
 
-    # ── feature sets ──────────────────────────────────────────────────────────
     meta_cols, anon_cols, anon_numeric_cols = get_feature_sets(df_train)
     print(f"\n  meta_cols ({len(meta_cols)}): {meta_cols}")
     print(f"  anon_cols: {len(anon_cols)}  |  anon_numeric: {len(anon_numeric_cols)}")
 
-    # ── walk-forward splits ────────────────────────────────────────────────────
     splits = walk_forward_time_splits(df_train[TIME_COL])
     print("\nWalk-Forward Folds:")
     for i, (tr, va) in enumerate(splits):
@@ -747,174 +1181,80 @@ def main():
               f"n_train={len(tr):,}  n_valid={len(va):,}  "
               f"embargo_ok={tr_di.max() < va_di.min()}")
 
-    # ── exploratory correlation snapshot ───────────────────────────────────────
     print("\n" + "="*60)
-    print("Exploratory: per-anonymous Pearson on full train (diagnostic only)")
+    print("Building fixed D7 representation")
     print("="*60)
-    df_corr = per_feature_correlation(df_train, anon_numeric_cols)
-    df_corr.to_csv(OUTPUT_DIR / "feature_correlations.csv", index=False)
-    print(df_corr.head(20).to_string(index=False))
-
-    # ── si history + si context on raw data ───────────────────────────────────
-    print("\n" + "="*60)
-    print("Building forward-safe si history (raw si, before any normalization)")
-    print("="*60)
-    si_col_before = df_train[STOCK_COL].copy()
-    meta_before   = df_train[meta_cols].copy()
-
-    df_train_h, df_test_h = add_forward_safe_si_history(df_train, df_test)
-    df_train_ctx, df_test_ctx = add_forward_safe_si_context(df_train_h, df_test_h)
-
-    # Proof assertions
-    assert df_train_h[STOCK_COL].reset_index(drop=True).equals(
-        si_col_before.reset_index(drop=True)
-    ), "si column was mutated by add_forward_safe_si_history!"
-    for col in meta_cols:
-        assert df_train_h[col].reset_index(drop=True).equals(
-            meta_before[col].reset_index(drop=True)
-        ), f"Meta column '{col}' was mutated by add_forward_safe_si_history!"
-    print("  ✓ si column unchanged after si-history build")
-    print("  ✓ All meta columns unchanged after si-history build")
-
-    hist_cols = ["si_hist_count", "si_hist_mean", "si_last_target", "si_hist_std"]
-    ctx_cols = ["si_seen_before", "si_log_count", "si_prev_gap_di"]
     base_cols = meta_cols + anon_cols
 
-    # ── unsupervised transforms over ALL anon numeric cols ────────────────────
-    df_train_rank = add_rank_features(df_train_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
-    df_test_rank = add_rank_features(df_test_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
+    df_train_rank = add_rank_features(df_train, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
+    df_test_rank = add_rank_features(df_test, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
     rank_cols = [f"{c}_csrank" for c in anon_numeric_cols if f"{c}_csrank" in df_train_rank.columns]
-    df_train_z_raw = cross_sectional_zscore_anonymous(df_train_ctx, anon_numeric_cols)
-    df_test_z_raw = cross_sectional_zscore_anonymous(df_test_ctx, anon_numeric_cols)
+    df_train_z_raw = cross_sectional_zscore_anonymous(df_train, anon_numeric_cols)
+    df_test_z_raw = cross_sectional_zscore_anonymous(df_test, anon_numeric_cols)
     z_cols = [f"{c}_z" for c in anon_numeric_cols]
     df_train_z_block = df_train_z_raw[anon_numeric_cols].copy()
     df_test_z_block = df_test_z_raw[anon_numeric_cols].copy()
     df_train_z_block.columns = z_cols
     df_test_z_block.columns = z_cols
 
-    sparse_cols = get_sparse_anon_cols(df_train_ctx, anon_cols, nan_frac_threshold=0.20)
-    df_train_sparse = add_sparse_indicators(df_train_ctx, sparse_cols)
-    df_test_sparse = add_sparse_indicators(df_test_ctx, sparse_cols)
+    sparse_cols = get_sparse_anon_cols(df_train, anon_cols, nan_frac_threshold=0.20)
+    df_train_sparse = add_sparse_indicators(df_train, sparse_cols)
+    df_test_sparse = add_sparse_indicators(df_test, sparse_cols)
     sparse_derived = []
     for c in sparse_cols:
         sparse_derived.extend([f"{c}_isna", f"{c}_filled0", f"{c}_present_x_value"])
 
     reps = [c for c in DEFAULT_FAMILY_REPS if c in anon_cols]
+    if len(reps) < 6:
+        reps = anon_cols[: min(12, len(anon_cols))]
     print(f"  sparse anonymous cols (>=20% NaN): {len(sparse_cols)}")
     print(f"  family representatives for fold-local interactions: {reps}")
 
-    # Assemble shared D frames once to avoid duplicate feature names.
-    df_train_d3 = pd.concat([df_train_ctx, df_train_z_block], axis=1)
-    df_test_d3 = pd.concat([df_test_ctx, df_test_z_block], axis=1)
     df_train_d4 = pd.concat([df_train_rank, df_train_z_block], axis=1)
     df_test_d4 = pd.concat([df_test_rank, df_test_z_block], axis=1)
     df_train_d6 = pd.concat([df_train_d4, df_train_sparse[sparse_derived]], axis=1)
     df_test_d6 = pd.concat([df_test_d4, df_test_sparse[sparse_derived]], axis=1)
+    d7_base_feat_cols = base_cols + rank_cols + z_cols + sparse_derived
+    print(f"  D7 base feature count before fold-local interactions: {len(d7_base_feat_cols)}")
 
-    # ── experiment definitions (Parts C + D) ──────────────────────────────────
-    experiments = [
-        {"name": "A_raw_features", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
-        {"name": "B1_raw_plus_si_context", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + ctx_cols},
-        {"name": "B2_raw_plus_target_history_audit", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + hist_cols},
-        {"name": "B3_raw_plus_si_context_plus_target_history_audit", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + ctx_cols + hist_cols},
-        {"name": "D1_raw", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
-        {"name": "D2_raw_plus_allrank", "mode": "plain", "df_tr": df_train_rank, "df_te": df_test_rank, "feat": base_cols + rank_cols},
-        {"name": "D3_raw_plus_allz", "mode": "plain", "df_tr": df_train_d3, "df_te": df_test_d3, "feat": base_cols + z_cols},
-        {"name": "D4_raw_plus_rank_plus_z", "mode": "plain", "df_tr": df_train_d4, "df_te": df_test_d4, "feat": base_cols + rank_cols + z_cols},
-        {"name": "D5_raw_plus_sparseflags", "mode": "plain", "df_tr": df_train_sparse, "df_te": df_test_sparse, "feat": base_cols + sparse_derived},
-        {"name": "D6_raw_plus_rank_plus_z_plus_sparseflags", "mode": "plain", "df_tr": df_train_d6, "df_te": df_test_d6, "feat": base_cols + rank_cols + z_cols + sparse_derived},
-        {"name": "D7_raw_plus_rank_plus_z_plus_sparseflags_plus_fold_interactions", "mode": "fold_interactions", "df_tr": df_train_d6, "df_te": df_test_d6, "feat": base_cols + rank_cols + z_cols + sparse_derived},
-    ]
+    print("\n" + "="*60)
+    print("D7 production candidates")
+    print("="*60)
+    cb_bag = run_catboost_bagged_d7(df_train_d6, df_test_d6, d7_base_feat_cols, splits, meta_cols, reps)
+    et = run_extratrees_d7(df_train_d6, df_test_d6, d7_base_feat_cols, splits, meta_cols, reps)
+    mlp = run_mlp_d7(df_train_d6, df_test_d6, d7_base_feat_cols, splits, meta_cols, reps)
+    blend = blend_predictions([cb_bag, et, mlp])
 
-    y = df_train[TARGET_COL].to_numpy(np.float64)
-    results_rows = []
-    best_exp = None
-
-    for exp in experiments:
-        print(f"\n{'='*60}")
-        print(f"EXPERIMENT {exp['name']}")
-        print("="*60)
-
-        if exp["mode"] == "fold_interactions":
-            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat, best_iters, fold_ix = (
-                run_catboost_with_fold_local_interactions(
-                    exp["df_tr"], exp["df_te"], exp["feat"], splits, meta_cols, reps, tag=exp["name"][:25]
-                )
-            )
-            (OUTPUT_DIR / f"fold_interactions_{exp['name']}.json").write_text(json.dumps(fold_ix, indent=2))
-        else:
-            feat_cols = [c for c in exp["feat"] if c in exp["df_tr"].columns]
-            print(f"  feature count: {len(feat_cols)}")
-            oof, test_pred, oof_score, fold_scores, cov_frac, covered, n_feat, best_iters = run_catboost(
-                exp["df_tr"], exp["df_te"], feat_cols, splits, meta_cols,
-                tag=exp["name"][:25],
-            )
-
-        # Save OOF predictions (oof_covered marks rows used in OOF Pearson)
-        pd.DataFrame({
-            "oof_pred": oof,
-            "target": y,
-            "oof_covered": covered.astype(np.int8),
-        }).to_csv(OUTPUT_DIR / f"oof_{exp['name']}.csv", index=False)
-        make_submission(df_test[ID_COL], test_pred, exp["name"])
-
-        row = {
-            "experiment":  exp["name"],
-            "n_features":  n_feat,
-            "oof_pearson": round(oof_score, 6),
-            "oof_coverage_frac": round(cov_frac, 6),
-            "foldwise_rank_selection": False,
-            "mean_best_iter": float(np.nanmean(best_iters)) if len(best_iters) else float("nan"),
-        }
-        for i, s in enumerate(fold_scores):
-            row[f"fold_{i}"] = round(s, 6)
-        for i, bi in enumerate(best_iters):
-            row[f"best_iter_{i}"] = int(bi)
-        results_rows.append(row)
-
-        if best_exp is None or oof_score > best_exp["oof_score"]:
-            best_exp = {
-                "name": exp["name"],
-                "oof_score": oof_score,
-                "oof_coverage_frac": cov_frac,
-            }
-
-    # ── save & print summary ───────────────────────────────────────────────────
-    df_results = pd.DataFrame(results_rows).sort_values("oof_pearson", ascending=False)
+    results = [cb_bag, et, mlp, blend]
+    covered = np.asarray(cb_bag["covered"], dtype=bool)
+    cb_oof = np.asarray(cb_bag["oof_pred"], dtype=np.float64)
+    rows = []
+    for res in results:
+        name = str(res["model_name"])
+        oof_pred = np.asarray(res["oof_pred"], dtype=np.float64)
+        pair_corr = pearson(cb_oof[covered], oof_pred[covered]) if name != "D7_cb_bag" else 1.0
+        rows.append({
+            "model_name": name,
+            "oof_pearson": round(float(res["oof_corr"]), 6),
+            "coverage_frac": round(float(res["coverage_frac"]), 6),
+            "pairwise_corr_with_cb_bag": round(float(pair_corr), 6),
+        })
+    df_results = pd.DataFrame(rows).sort_values("oof_pearson", ascending=False).reset_index(drop=True)
     df_results.to_csv(OUTPUT_DIR / "advanced_experiment_results.csv", index=False)
 
     print("\n" + "="*60)
-    print("EXPERIMENT SUMMARY (sorted by OOF Pearson)")
+    print("MODEL SUMMARY (sorted by OOF Pearson)")
     print("="*60)
     print(df_results.to_string(index=False))
-    a_score = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "A_raw_features"), np.nan)
-    if np.isfinite(a_score):
-        promoted = [r["experiment"] for r in results_rows if (r["oof_pearson"] - a_score) >= 0.002]
-        print(f"\nPromotion rule (+0.002 vs A): {promoted if promoted else 'none'}")
-    b1 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B1_raw_plus_si_context"), np.nan)
-    b2 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B2_raw_plus_target_history_audit"), np.nan)
-    b3 = next((r["oof_pearson"] for r in results_rows if r["experiment"] == "B3_raw_plus_si_context_plus_target_history_audit"), np.nan)
-    if np.isfinite(a_score) and np.isfinite(b1):
-        print("Decision B1 vs A:", "drop si engineered mainline" if b1 <= a_score else "keep si context in research")
-    if np.isfinite(a_score) and (np.isfinite(b2) or np.isfinite(b3)):
-        if (np.isfinite(b2) and b2 < a_score) or (np.isfinite(b3) and b3 < a_score):
-            print("Decision B2/B3: archive target-history (no mainline use)")
-
-    print(
-        f"\n→ Best experiment: {best_exp['name']}  "
-        f"OOF={best_exp['oof_score']:.6f}  "
-        f"coverage_frac={best_exp['oof_coverage_frac']:.4f}"
-    )
-    print("\nMeta column protection proof:")
-    for col in meta_cols:
-        print(f"  {col}: unchanged ✓")
-    print("si history built before any anonymous normalization: ✓")
 
     summary = {
-        "best_experiment":       best_exp["name"],
-        "best_oof_pearson":      best_exp["oof_score"],
-        "best_oof_coverage_frac": best_exp["oof_coverage_frac"],
-        "experiments":           results_rows,
+        "production_candidates": [str(r["model_name"]) for r in results],
+        "d7_base_feature_count": len(d7_base_feat_cols),
+        "rank_feature_count": len(rank_cols),
+        "z_feature_count": len(z_cols),
+        "sparse_feature_count": len(sparse_derived),
+        "models": rows,
+        "blend_weights": blend["weights"],
     }
     (OUTPUT_DIR / "advanced_summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
