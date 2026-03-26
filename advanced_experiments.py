@@ -784,9 +784,13 @@ def main():
     df_train_rank = add_rank_features(df_train_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
     df_test_rank = add_rank_features(df_test_ctx, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
     rank_cols = [f"{c}_csrank" for c in anon_numeric_cols if f"{c}_csrank" in df_train_rank.columns]
-    df_train_z = cross_sectional_zscore_anonymous(df_train_ctx, anon_numeric_cols)
-    df_test_z = cross_sectional_zscore_anonymous(df_test_ctx, anon_numeric_cols)
-    z_cols = anon_numeric_cols
+    df_train_z_raw = cross_sectional_zscore_anonymous(df_train_ctx, anon_numeric_cols)
+    df_test_z_raw = cross_sectional_zscore_anonymous(df_test_ctx, anon_numeric_cols)
+    z_cols = [f"{c}_z" for c in anon_numeric_cols]
+    df_train_z_block = df_train_z_raw[anon_numeric_cols].copy()
+    df_test_z_block = df_test_z_raw[anon_numeric_cols].copy()
+    df_train_z_block.columns = z_cols
+    df_test_z_block.columns = z_cols
 
     sparse_cols = get_sparse_anon_cols(df_train_ctx, anon_cols, nan_frac_threshold=0.20)
     df_train_sparse = add_sparse_indicators(df_train_ctx, sparse_cols)
@@ -799,6 +803,14 @@ def main():
     print(f"  sparse anonymous cols (>=20% NaN): {len(sparse_cols)}")
     print(f"  family representatives for fold-local interactions: {reps}")
 
+    # Assemble shared D frames once to avoid duplicate feature names.
+    df_train_d3 = pd.concat([df_train_ctx, df_train_z_block], axis=1)
+    df_test_d3 = pd.concat([df_test_ctx, df_test_z_block], axis=1)
+    df_train_d4 = pd.concat([df_train_rank, df_train_z_block], axis=1)
+    df_test_d4 = pd.concat([df_test_rank, df_test_z_block], axis=1)
+    df_train_d6 = pd.concat([df_train_d4, df_train_sparse[sparse_derived]], axis=1)
+    df_test_d6 = pd.concat([df_test_d4, df_test_sparse[sparse_derived]], axis=1)
+
     # ── experiment definitions (Parts C + D) ──────────────────────────────────
     experiments = [
         {"name": "A_raw_features", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
@@ -807,11 +819,11 @@ def main():
         {"name": "B3_raw_plus_si_context_plus_target_history_audit", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols + ctx_cols + hist_cols},
         {"name": "D1_raw", "mode": "plain", "df_tr": df_train_ctx, "df_te": df_test_ctx, "feat": base_cols},
         {"name": "D2_raw_plus_allrank", "mode": "plain", "df_tr": df_train_rank, "df_te": df_test_rank, "feat": base_cols + rank_cols},
-        {"name": "D3_raw_plus_allz", "mode": "plain", "df_tr": df_train_z, "df_te": df_test_z, "feat": base_cols + z_cols},
-        {"name": "D4_raw_plus_rank_plus_z", "mode": "plain", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z"), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z"), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols]},
+        {"name": "D3_raw_plus_allz", "mode": "plain", "df_tr": df_train_d3, "df_te": df_test_d3, "feat": base_cols + z_cols},
+        {"name": "D4_raw_plus_rank_plus_z", "mode": "plain", "df_tr": df_train_d4, "df_te": df_test_d4, "feat": base_cols + rank_cols + z_cols},
         {"name": "D5_raw_plus_sparseflags", "mode": "plain", "df_tr": df_train_sparse, "df_te": df_test_sparse, "feat": base_cols + sparse_derived},
-        {"name": "D6_raw_plus_rank_plus_z_plus_sparseflags", "mode": "plain", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z").join(df_train_sparse[sparse_derived]), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z").join(df_test_sparse[sparse_derived]), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols] + sparse_derived},
-        {"name": "D7_raw_plus_rank_plus_z_plus_sparseflags_plus_fold_interactions", "mode": "fold_interactions", "df_tr": df_train_rank.join(df_train_z[z_cols], rsuffix="_z").join(df_train_sparse[sparse_derived]), "df_te": df_test_rank.join(df_test_z[z_cols], rsuffix="_z").join(df_test_sparse[sparse_derived]), "feat": base_cols + rank_cols + [f"{c}_z" for c in z_cols] + sparse_derived},
+        {"name": "D6_raw_plus_rank_plus_z_plus_sparseflags", "mode": "plain", "df_tr": df_train_d6, "df_te": df_test_d6, "feat": base_cols + rank_cols + z_cols + sparse_derived},
+        {"name": "D7_raw_plus_rank_plus_z_plus_sparseflags_plus_fold_interactions", "mode": "fold_interactions", "df_tr": df_train_d6, "df_te": df_test_d6, "feat": base_cols + rank_cols + z_cols + sparse_derived},
     ]
 
     y = df_train[TARGET_COL].to_numpy(np.float64)

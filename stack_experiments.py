@@ -39,11 +39,13 @@ def get_feature_sets(df: pd.DataFrame):
 
 def add_rank_features(df, cols, group_col=PRIMARY_TIME_COL, suffix="_csrank"):
     out = df.copy()
+    use_cols = [c for c in cols if c in out.columns]
+    if not use_cols:
+        return out
     grp = out.groupby(group_col, sort=False)
-    for c in cols:
-        if c in out.columns:
-            out[f"{c}{suffix}"] = grp[c].rank(pct=True, na_option="keep")
-    return out
+    rank_block = grp[use_cols].rank(pct=True, na_option="keep")
+    rank_block.columns = [f"{c}{suffix}" for c in use_cols]
+    return pd.concat([out, rank_block], axis=1)
 
 
 def cross_sectional_zscore_anonymous(df, anon_numeric_cols, group_col=PRIMARY_TIME_COL):
@@ -55,8 +57,11 @@ def cross_sectional_zscore_anonymous(df, anon_numeric_cols, group_col=PRIMARY_TI
     for g in np.unique(groups):
         m = groups == g
         sub = arr[m]
-        mu = np.nanmean(sub, axis=0)
-        sd = np.nanstd(sub, axis=0)
+        with np.errstate(invalid="ignore"):
+            mu = np.nanmean(sub, axis=0)
+            sd = np.nanstd(sub, axis=0)
+        mu[~np.isfinite(mu)] = 0.0
+        sd[~np.isfinite(sd)] = 1.0
         sd[sd == 0] = 1.0
         result[m] = (sub - mu) / (sd + 1e-8)
     out[f_cols] = result.astype(np.float32)
@@ -70,13 +75,24 @@ def get_sparse_anon_cols(df_train, anon_cols, nan_frac_threshold=0.20):
 
 def add_sparse_indicators(df, sparse_cols):
     out = df.copy()
+    blocks = []
     for c in sparse_cols:
-        filled = out[c].fillna(0.0).astype(np.float32)
-        isna = out[c].isna().astype(np.int8)
-        out[f"{c}_isna"] = isna
-        out[f"{c}_filled0"] = filled
-        out[f"{c}_present_x_value"] = filled * (1.0 - isna.astype(np.float32))
-    return out
+        if c not in out.columns:
+            continue
+        filled = out[c].fillna(0.0).to_numpy(np.float32)
+        isna = out[c].isna().to_numpy(np.int8)
+        block = pd.DataFrame(
+            {
+                f"{c}_isna": isna,
+                f"{c}_filled0": filled,
+                f"{c}_present_x_value": filled * (1.0 - isna.astype(np.float32)),
+            },
+            index=out.index,
+        )
+        blocks.append(block)
+    if not blocks:
+        return out
+    return pd.concat([out] + blocks, axis=1)
 
 
 def build_best_d_block(df_train: pd.DataFrame, df_test: pd.DataFrame):
@@ -101,12 +117,14 @@ def build_best_d_block(df_train: pd.DataFrame, df_test: pd.DataFrame):
 
     tr = df_tr_rank.copy()
     te = df_te_rank.copy()
-    for c in anon_num:
-        tr[f"{c}_z"] = df_tr_z[c].to_numpy()
-        te[f"{c}_z"] = df_te_z[c].to_numpy()
-    for c in sparse_cols:
-        tr[c] = df_tr_sp[c].to_numpy()
-        te[c] = df_te_sp[c].to_numpy()
+    z_tr = df_tr_z[anon_num].copy()
+    z_te = df_te_z[anon_num].copy()
+    z_tr.columns = [f"{c}_z" for c in anon_num]
+    z_te.columns = [f"{c}_z" for c in anon_num]
+    sp_tr = df_tr_sp[sparse_cols].copy() if sparse_cols else pd.DataFrame(index=df_train.index)
+    sp_te = df_te_sp[sparse_cols].copy() if sparse_cols else pd.DataFrame(index=df_test.index)
+    tr = pd.concat([tr, z_tr, sp_tr], axis=1)
+    te = pd.concat([te, z_te, sp_te], axis=1)
     feat = [c for c in (meta + anon + rank_cols + z_cols + sparse_cols) if c in tr.columns and c in te.columns]
     return tr, te, feat, meta
 
