@@ -8,6 +8,7 @@ Parts C/D:
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import math
@@ -24,6 +25,8 @@ TRAIN_PATH = "train.csv"
 TEST_PATH  = "test.csv"
 OUTPUT_DIR = Path("artifacts")
 OUTPUT_DIR.mkdir(exist_ok=True)
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 ID_COL     = "id"
 TARGET_COL = "target"
@@ -1398,6 +1401,157 @@ def _compute_fold_scores_from_oof(y: np.ndarray, oof_pred: np.ndarray, splits: l
     return [pearson(y[va_idx], oof_pred[va_idx]) for _, va_idx in splits]
 
 
+def parse_fold_list(folds_arg: str | None, n_splits: int) -> list[int]:
+    if folds_arg is None or folds_arg.strip() == "":
+        return list(range(n_splits))
+    out = []
+    for token in folds_arg.split(","):
+        token = token.strip()
+        if token == "":
+            continue
+        fold_id = int(token)
+        if fold_id < 0 or fold_id >= n_splits:
+            raise ValueError(f"Fold {fold_id} outside valid range [0, {n_splits - 1}]")
+        if fold_id not in out:
+            out.append(fold_id)
+    if not out:
+        raise ValueError("No valid folds parsed from --folds")
+    return out
+
+
+def _stage_prefix(stage_name: str) -> str:
+    return stage_name.replace("/", "_")
+
+
+def get_fold_checkpoint_npz(stage_name: str, fold_id: int) -> Path:
+    return CHECKPOINT_DIR / f"{_stage_prefix(stage_name)}_fold{fold_id}.npz"
+
+
+def get_fold_checkpoint_json(stage_name: str, fold_id: int) -> Path:
+    return CHECKPOINT_DIR / f"{_stage_prefix(stage_name)}_fold{fold_id}.json"
+
+
+def save_fold_checkpoint(
+    stage_name: str,
+    fold_id: int,
+    va_idx: np.ndarray,
+    oof_pred: np.ndarray,
+    test_pred: np.ndarray,
+    metadata: dict[str, object],
+) -> None:
+    np.savez_compressed(
+        get_fold_checkpoint_npz(stage_name, fold_id),
+        va_idx=np.asarray(va_idx, dtype=np.int64),
+        oof_pred=np.asarray(oof_pred, dtype=np.float64),
+        test_pred=np.asarray(test_pred, dtype=np.float64),
+    )
+    get_fold_checkpoint_json(stage_name, fold_id).write_text(json.dumps(metadata, indent=2))
+
+
+def load_fold_checkpoint(stage_name: str, fold_id: int) -> dict[str, object] | None:
+    npz_path = get_fold_checkpoint_npz(stage_name, fold_id)
+    json_path = get_fold_checkpoint_json(stage_name, fold_id)
+    if not npz_path.exists() or not json_path.exists():
+        return None
+    payload = np.load(npz_path)
+    meta = json.loads(json_path.read_text())
+    return {
+        "va_idx": payload["va_idx"],
+        "oof_pred": payload["oof_pred"],
+        "test_pred": payload["test_pred"],
+        "metadata": meta,
+    }
+
+
+def summarize_checkpoint_status(stage_name: str, folds_to_run: list[int]) -> tuple[list[int], list[int]]:
+    done = []
+    missing = []
+    for fold_id in folds_to_run:
+        if load_fold_checkpoint(stage_name, fold_id) is None:
+            missing.append(fold_id)
+        else:
+            done.append(fold_id)
+    return done, missing
+
+
+def aggregate_fold_checkpoints(
+    stage_name: str,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float], dict[str, object], float]:
+    y = df_train[TARGET_COL].to_numpy(np.float64)
+    oof = np.zeros(len(df_train), dtype=np.float64)
+    covered = np.zeros(len(df_train), dtype=bool)
+    test_preds = []
+    fold_scores = []
+    fold_metadata: dict[str, object] = {}
+    n_features = []
+
+    for fold_id, (_, va_idx_expected) in enumerate(splits):
+        ckpt = load_fold_checkpoint(stage_name, fold_id)
+        if ckpt is None:
+            raise FileNotFoundError(f"Missing checkpoint for {stage_name} fold {fold_id}")
+        va_idx = np.asarray(ckpt["va_idx"], dtype=np.int64)
+        if not np.array_equal(va_idx, np.asarray(va_idx_expected, dtype=np.int64)):
+            raise ValueError(f"Checkpoint validation indices do not match current splits for {stage_name} fold {fold_id}")
+        fold_pred = np.asarray(ckpt["oof_pred"], dtype=np.float64)
+        oof[va_idx] = fold_pred
+        covered[va_idx] = True
+        test_preds.append(np.asarray(ckpt["test_pred"], dtype=np.float64))
+        meta = dict(ckpt["metadata"])
+        fold_metadata[str(fold_id)] = meta
+        fold_scores.append(float(meta["fold_score"]))
+        if "n_features" in meta:
+            n_features.append(float(meta["n_features"]))
+
+    test_avg = np.mean(np.stack(test_preds, axis=0), axis=0)
+    n_features_mean = float(np.mean(n_features)) if n_features else float("nan")
+    return oof, test_avg, covered, fold_scores, fold_metadata, n_features_mean
+
+
+def build_stage_result_from_checkpoints(
+    stage_name: str,
+    model_name: str,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    submission_name: str,
+    metadata_filename: str,
+    write_noclip: bool = False,
+    mean_best_iter_or_epochs: float = float("nan"),
+) -> dict[str, object]:
+    y = df_train[TARGET_COL].to_numpy(np.float64)
+    oof_avg, test_avg, covered, fold_scores, fold_metadata, n_features_mean = aggregate_fold_checkpoints(
+        stage_name, df_train, df_test, splits
+    )
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
+    pd.DataFrame({
+        "oof_pred": oof_avg,
+        "target": y,
+        "oof_covered": covered.astype(np.int8),
+    }).to_csv(OUTPUT_DIR / f"oof_{submission_name}.csv", index=False)
+    make_submission(df_test[ID_COL], test_avg, submission_name, clip=True)
+    if write_noclip:
+        make_submission(df_test[ID_COL], test_avg, f"{submission_name}_noclip", clip=False)
+    (OUTPUT_DIR / metadata_filename).write_text(json.dumps(fold_metadata, indent=2))
+    return {
+        "model_name": model_name,
+        "oof_pred": oof_avg,
+        "test_pred": test_avg,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test[ID_COL].to_numpy(),
+        "mean_best_iter_or_epochs": mean_best_iter_or_epochs,
+        "fold_scores": fold_scores,
+        "recent_fold_mean": float(np.nanmean(fold_scores[3:5])),
+        "last_fold_score": float(fold_scores[4]),
+        "n_features_mean": n_features_mean,
+    }
+
+
 def run_extratrees_d7_peer(
     df_train_base: pd.DataFrame,
     df_test_base: pd.DataFrame,
@@ -1405,6 +1559,9 @@ def run_extratrees_d7_peer(
     splits: list[tuple[np.ndarray, np.ndarray]],
     meta_cols: list[str],
     sparse_cols: list[str],
+    folds_to_run: list[int] | None = None,
+    skip_completed: bool = True,
+    finalize: bool = True,
 ):
     from sklearn.ensemble import ExtraTreesRegressor
 
@@ -1424,18 +1581,27 @@ def run_extratrees_d7_peer(
     fold_metadata: dict[str, object] = {}
     n_features_per_fold: list[int] = []
 
+    folds_to_run = list(range(len(splits))) if folds_to_run is None else folds_to_run
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        if fold_id not in folds_to_run:
+            continue
+        if skip_completed and load_fold_checkpoint("et_peer", fold_id) is not None:
+            print(f"  [D7_et_peer] fold {fold_id}: checkpoint exists, skipping")
+            continue
         Xtr, Xva, Xte, feature_names, peer_cols, reps, ix_cols = _prepare_d7_et_peer_fold_dataset(
             df_train_base, df_test_base, base_feat_cols, meta_cols, tr_idx, va_idx, sparse_cols
         )
         n_features_per_fold.append(len(feature_names))
-        fold_metadata[str(fold_id)] = {
+        fold_meta = {
             "selected_peer_cols": peer_cols,
             "selected_reps": reps,
             "selected_interactions": ix_cols,
             "n_features": len(feature_names),
         }
+        fold_metadata[str(fold_id)] = fold_meta
         Xtr_imp, Xva_imp, Xte_imp = _fit_numeric_preprocessor(Xtr, Xva, Xte, standardize=False)
+        fold_oof_sum = np.zeros(len(va_idx), dtype=np.float64)
+        fold_test_sum = np.zeros(len(df_test_base), dtype=np.float64)
         for seed, max_features, min_leaf in settings:
             tag = f"D7_et_peer_s{seed}_mf{max_features:.2f}_leaf{min_leaf}"
             model = ExtraTreesRegressor(
@@ -1449,8 +1615,8 @@ def run_extratrees_d7_peer(
             model.fit(Xtr_imp, y[tr_idx])
             p_va = model.predict(Xva_imp)
             p_te = model.predict(Xte_imp)
-            oof_sum[va_idx] += p_va
-            test_sum += p_te / len(splits)
+            fold_oof_sum += p_va
+            fold_test_sum += p_te
             print(
                 f"  [{tag}] fold {fold_id}: Pearson={pearson(y[va_idx], p_va):.6f}  "
                 f"n_features={len(feature_names)}  peer_cols={len(peer_cols)}  interactions={len(ix_cols)}"
@@ -1458,33 +1624,41 @@ def run_extratrees_d7_peer(
             del model
             gc.collect()
 
-    oof_avg = oof_sum / len(settings)
-    test_avg = test_sum / len(settings)
-    fold_scores = _compute_fold_scores_from_oof(y, oof_avg, splits)
-    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
-    pd.DataFrame({
-        "oof_pred": oof_avg,
-        "target": y,
-        "oof_covered": covered.astype(np.int8),
-    }).to_csv(OUTPUT_DIR / "oof_D7_et_peer.csv", index=False)
-    make_submission(df_test_base[ID_COL], test_avg, "D7_et_peer", clip=True)
-    make_submission(df_test_base[ID_COL], test_avg, "D7_et_peer_noclip", clip=False)
-    (OUTPUT_DIR / "D7_et_peer_fold_metadata.json").write_text(json.dumps(fold_metadata, indent=2))
-    return {
-        "model_name": "D7_et_peer",
-        "oof_pred": oof_avg,
-        "test_pred": test_avg,
-        "oof_corr": oof_score,
-        "coverage_frac": cov_frac,
-        "covered": covered,
-        "target": y,
-        "test_ids": df_test_base[ID_COL].to_numpy(),
-        "mean_best_iter_or_epochs": 1200.0,
-        "fold_scores": fold_scores,
-        "recent_fold_mean": float(np.nanmean(fold_scores[3:5])),
-        "last_fold_score": float(fold_scores[4]),
-        "n_features_mean": float(np.mean(n_features_per_fold)) if n_features_per_fold else float("nan"),
-    }
+        fold_oof_avg = fold_oof_sum / len(settings)
+        fold_test_avg = fold_test_sum / len(settings)
+        fold_score = pearson(y[va_idx], fold_oof_avg)
+        fold_meta["fold_score"] = float(fold_score)
+        save_fold_checkpoint(
+            "et_peer",
+            fold_id,
+            va_idx=va_idx,
+            oof_pred=fold_oof_avg,
+            test_pred=fold_test_avg,
+            metadata=fold_meta,
+        )
+        oof_sum[va_idx] = fold_oof_avg
+        test_sum += fold_test_avg
+        covered[va_idx] = True
+
+    if not finalize:
+        done, missing = summarize_checkpoint_status("et_peer", list(range(len(splits))))
+        return {
+            "model_name": "D7_et_peer",
+            "completed_folds": done,
+            "missing_folds": missing,
+        }
+
+    return build_stage_result_from_checkpoints(
+        "et_peer",
+        "D7_et_peer",
+        df_train_base,
+        df_test_base,
+        splits,
+        submission_name="D7_et_peer",
+        metadata_filename="D7_et_peer_fold_metadata.json",
+        write_noclip=True,
+        mean_best_iter_or_epochs=1200.0,
+    )
 
 
 def run_catboost_d7_peer(
@@ -1494,6 +1668,9 @@ def run_catboost_d7_peer(
     splits: list[tuple[np.ndarray, np.ndarray]],
     meta_cols: list[str],
     sparse_cols: list[str],
+    folds_to_run: list[int] | None = None,
+    skip_completed: bool = True,
+    finalize: bool = True,
 ):
     from catboost import CatBoostRegressor
 
@@ -1512,16 +1689,23 @@ def run_catboost_d7_peer(
     fold_metadata: dict[str, object] = {}
     n_features_per_fold: list[int] = []
 
+    folds_to_run = list(range(len(splits))) if folds_to_run is None else folds_to_run
     for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        if fold_id not in folds_to_run:
+            continue
+        if skip_completed and load_fold_checkpoint("cb_peer", fold_id) is not None:
+            print(f"  [D7_cb_peer] fold {fold_id}: checkpoint exists, skipping")
+            continue
         blocks = _prepare_d7_peer_fold_blocks(
             df_train_base, df_test_base, base_feat_cols, meta_cols, tr_idx, va_idx, sparse_cols
         )
-        fold_metadata[str(fold_id)] = {
+        fold_meta = {
             "selected_peer_cols": blocks["selected_peer_cols"],
             "selected_reps": blocks["selected_reps"],
             "selected_interactions": blocks["selected_interactions"],
             "n_features": len(blocks["feature_names"]),
         }
+        fold_metadata[str(fold_id)] = fold_meta
         n_features_per_fold.append(len(blocks["feature_names"]))
         cb_train = blocks["cb_train"].copy()
         cb_valid = blocks["cb_valid"].copy()
@@ -1531,6 +1715,8 @@ def run_catboost_d7_peer(
             cb_train[c] = cb_train[c].astype(str)
             cb_valid[c] = cb_valid[c].astype(str)
             cb_test[c] = cb_test[c].astype(str)
+        fold_oof_sum = np.zeros(len(va_idx), dtype=np.float64)
+        fold_test_sum = np.zeros(len(df_test_base), dtype=np.float64)
         for cfg_name, cfg in configs.items():
             for seed in seeds:
                 tag = f"D7_cb_peer_{cfg_name}_s{seed}"
@@ -1557,8 +1743,8 @@ def run_catboost_d7_peer(
                 )
                 p_va = model.predict(cb_valid)
                 p_te = model.predict(cb_test)
-                oof_sum[va_idx] += p_va
-                test_sum += p_te / len(splits)
+                fold_oof_sum += p_va
+                fold_test_sum += p_te
                 bi = int(model.best_iteration_) if model.best_iteration_ is not None else -1
                 print(
                     f"  [{tag}] fold {fold_id}: Pearson={pearson(y[va_idx], p_va):.6f}  "
@@ -1568,33 +1754,42 @@ def run_catboost_d7_peer(
                 del model
                 gc.collect()
 
-    n_models = len(configs) * len(seeds)
-    oof_avg = oof_sum / n_models
-    test_avg = test_sum / n_models
-    fold_scores = _compute_fold_scores_from_oof(y, oof_avg, splits)
-    oof_score, cov_frac = oof_pearson_on_covered(y, oof_avg, covered)
-    pd.DataFrame({
-        "oof_pred": oof_avg,
-        "target": y,
-        "oof_covered": covered.astype(np.int8),
-    }).to_csv(OUTPUT_DIR / "oof_D7_cb_peer.csv", index=False)
-    make_submission(df_test_base[ID_COL], test_avg, "D7_cb_peer", clip=True)
-    (OUTPUT_DIR / "D7_cb_peer_fold_metadata.json").write_text(json.dumps(fold_metadata, indent=2))
-    return {
-        "model_name": "D7_cb_peer",
-        "oof_pred": oof_avg,
-        "test_pred": test_avg,
-        "oof_corr": oof_score,
-        "coverage_frac": cov_frac,
-        "covered": covered,
-        "target": y,
-        "test_ids": df_test_base[ID_COL].to_numpy(),
-        "mean_best_iter_or_epochs": float("nan"),
-        "fold_scores": fold_scores,
-        "recent_fold_mean": float(np.nanmean(fold_scores[3:5])),
-        "last_fold_score": float(fold_scores[4]),
-        "n_features_mean": float(np.mean(n_features_per_fold)) if n_features_per_fold else float("nan"),
-    }
+        n_models = len(configs) * len(seeds)
+        fold_oof_avg = fold_oof_sum / n_models
+        fold_test_avg = fold_test_sum / n_models
+        fold_score = pearson(y[va_idx], fold_oof_avg)
+        fold_meta["fold_score"] = float(fold_score)
+        save_fold_checkpoint(
+            "cb_peer",
+            fold_id,
+            va_idx=va_idx,
+            oof_pred=fold_oof_avg,
+            test_pred=fold_test_avg,
+            metadata=fold_meta,
+        )
+        oof_sum[va_idx] = fold_oof_avg
+        test_sum += fold_test_avg
+        covered[va_idx] = True
+
+    if not finalize:
+        done, missing = summarize_checkpoint_status("cb_peer", list(range(len(splits))))
+        return {
+            "model_name": "D7_cb_peer",
+            "completed_folds": done,
+            "missing_folds": missing,
+        }
+
+    return build_stage_result_from_checkpoints(
+        "cb_peer",
+        "D7_cb_peer",
+        df_train_base,
+        df_test_base,
+        splits,
+        submission_name="D7_cb_peer",
+        metadata_filename="D7_cb_peer_fold_metadata.json",
+        write_noclip=False,
+        mean_best_iter_or_epochs=float("nan"),
+    )
 
 
 def blend_et_cb_peer(
@@ -1696,6 +1891,25 @@ def make_submission(test_ids, preds, name, clip: bool = True):
 
 # ── main ───────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="Advanced D7 ET/CB production runner with fold checkpoints.")
+    parser.add_argument(
+        "--stage",
+        choices=["all", "et_peer", "cb_peer", "aggregate"],
+        default="all",
+        help="Run ET only, CB only, full pipeline, or aggregate from checkpoints.",
+    )
+    parser.add_argument(
+        "--folds",
+        default=None,
+        help="Comma-separated fold ids to run for training stages, e.g. '0,1' or '3'.",
+    )
+    parser.add_argument(
+        "--recompute-completed",
+        action="store_true",
+        help="Recompute folds even if checkpoint files already exist.",
+    )
+    args = parser.parse_args()
+
     print("Loading data...")
     df_train = pd.read_csv(TRAIN_PATH)
     df_test = pd.read_csv(TEST_PATH)
@@ -1716,6 +1930,10 @@ def main():
             f"n_train={len(tr):,}  n_valid={len(va):,}  "
             f"embargo_ok={tr_di.max() < va_di.min()}"
         )
+    folds_to_run = parse_fold_list(args.folds, len(splits))
+    print(f"\nStage: {args.stage}")
+    print(f"Requested folds: {folds_to_run}")
+    print(f"Checkpoint directory: {CHECKPOINT_DIR.resolve()}")
 
     print("\n" + "=" * 60)
     print("Building fixed D7 representation")
@@ -1750,19 +1968,121 @@ def main():
     print("\n" + "=" * 60)
     print("D7 ET-first production candidates")
     print("=" * 60)
-    et_peer = run_extratrees_d7_peer(df_train_d6, df_test_d6, d7_base_feat_cols, splits, meta_cols, sparse_cols)
-    cb_peer = run_catboost_d7_peer(df_train_d6, df_test_d6, d7_base_feat_cols, splits, meta_cols, sparse_cols)
-
-    results = [et_peer, cb_peer]
-    blend_peer = None
-    if cb_peer["recent_fold_mean"] + 0.002 >= et_peer["recent_fold_mean"]:
-        blend_peer = blend_et_cb_peer(et_peer, cb_peer, splits)
-        results.append(blend_peer)
-    else:
-        print(
-            "\nSkipping ET+CB peer blend because CB peer is clearly worse on recent folds: "
-            f"ET recent={et_peer['recent_fold_mean']:.6f}, CB recent={cb_peer['recent_fold_mean']:.6f}"
+    if args.stage == "et_peer":
+        done, missing = summarize_checkpoint_status("et_peer", list(range(len(splits))))
+        print(f"Existing ET checkpoints: done={done} missing={missing}")
+        status = run_extratrees_d7_peer(
+            df_train_d6,
+            df_test_d6,
+            d7_base_feat_cols,
+            splits,
+            meta_cols,
+            sparse_cols,
+            folds_to_run=folds_to_run,
+            skip_completed=not args.recompute_completed,
+            finalize=False,
         )
+        print(f"ET checkpoint status after run: completed={status['completed_folds']} missing={status['missing_folds']}")
+        print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
+        return
+
+    if args.stage == "cb_peer":
+        done, missing = summarize_checkpoint_status("cb_peer", list(range(len(splits))))
+        print(f"Existing CB checkpoints: done={done} missing={missing}")
+        status = run_catboost_d7_peer(
+            df_train_d6,
+            df_test_d6,
+            d7_base_feat_cols,
+            splits,
+            meta_cols,
+            sparse_cols,
+            folds_to_run=folds_to_run,
+            skip_completed=not args.recompute_completed,
+            finalize=False,
+        )
+        print(f"CB checkpoint status after run: completed={status['completed_folds']} missing={status['missing_folds']}")
+        print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
+        return
+
+    if args.stage == "all":
+        run_extratrees_d7_peer(
+            df_train_d6,
+            df_test_d6,
+            d7_base_feat_cols,
+            splits,
+            meta_cols,
+            sparse_cols,
+            folds_to_run=list(range(len(splits))),
+            skip_completed=not args.recompute_completed,
+            finalize=False,
+        )
+        run_catboost_d7_peer(
+            df_train_d6,
+            df_test_d6,
+            d7_base_feat_cols,
+            splits,
+            meta_cols,
+            sparse_cols,
+            folds_to_run=list(range(len(splits))),
+            skip_completed=not args.recompute_completed,
+            finalize=False,
+        )
+
+    et_done, et_missing = summarize_checkpoint_status("et_peer", list(range(len(splits))))
+    cb_done, cb_missing = summarize_checkpoint_status("cb_peer", list(range(len(splits))))
+    print(f"Checkpoint status ET: done={et_done} missing={et_missing}")
+    print(f"Checkpoint status CB: done={cb_done} missing={cb_missing}")
+
+    results = []
+    et_peer = None
+    cb_peer = None
+    blend_peer = None
+    if not et_missing:
+        et_peer = build_stage_result_from_checkpoints(
+            "et_peer",
+            "D7_et_peer",
+            df_train_d6,
+            df_test_d6,
+            splits,
+            submission_name="D7_et_peer",
+            metadata_filename="D7_et_peer_fold_metadata.json",
+            write_noclip=True,
+            mean_best_iter_or_epochs=1200.0,
+        )
+        results.append(et_peer)
+    else:
+        print("Skipping ET aggregation because not all ET checkpoints exist.")
+
+    if not cb_missing:
+        cb_peer = build_stage_result_from_checkpoints(
+            "cb_peer",
+            "D7_cb_peer",
+            df_train_d6,
+            df_test_d6,
+            splits,
+            submission_name="D7_cb_peer",
+            metadata_filename="D7_cb_peer_fold_metadata.json",
+            write_noclip=False,
+            mean_best_iter_or_epochs=float("nan"),
+        )
+        results.append(cb_peer)
+    else:
+        print("Skipping CB aggregation because not all CB checkpoints exist.")
+
+    if et_peer is not None and cb_peer is not None:
+        if cb_peer["recent_fold_mean"] + 0.002 >= et_peer["recent_fold_mean"]:
+            blend_peer = blend_et_cb_peer(et_peer, cb_peer, splits)
+            results.append(blend_peer)
+        else:
+            print(
+                "\nSkipping ET+CB peer blend because CB peer is clearly worse on recent folds: "
+                f"ET recent={et_peer['recent_fold_mean']:.6f}, CB recent={cb_peer['recent_fold_mean']:.6f}"
+            )
+
+    if not results:
+        print("\nNo complete stages available to aggregate yet.")
+        print(f"All outputs in: {OUTPUT_DIR.resolve()}")
+        return
 
     df_results = build_production_model_summary(results)
     print("\n" + "=" * 60)
@@ -1770,12 +2090,15 @@ def main():
     print("=" * 60)
     print(df_results.to_string(index=False))
 
-    submit_order = [
-        "submission_D7_et_peer_noclip.csv",
-        "submission_D7_et_peer.csv",
-        "submission_D7_cb_peer.csv",
-    ]
-    if blend_peer is not None and (
+    submit_order = []
+    if et_peer is not None:
+        submit_order.extend([
+            "submission_D7_et_peer_noclip.csv",
+            "submission_D7_et_peer.csv",
+        ])
+    if cb_peer is not None:
+        submit_order.append("submission_D7_cb_peer.csv")
+    if blend_peer is not None and et_peer is not None and (
         blend_peer["oof_corr"] > et_peer["oof_corr"]
         and blend_peer["recent_fold_mean"] > et_peer["recent_fold_mean"]
     ):
@@ -1793,7 +2116,11 @@ def main():
         "sparse_feature_count": len(sparse_derived),
         "models": df_results.to_dict(orient="records"),
         "submit_order": submit_order,
-        "et_noclip_saved_unclipped": True,
+        "et_noclip_saved_unclipped": et_peer is not None,
+        "checkpoint_status": {
+            "et_peer": {"done": et_done, "missing": et_missing},
+            "cb_peer": {"done": cb_done, "missing": cb_missing},
+        },
     }
     if blend_peer is not None:
         summary["blend_weights_peer"] = blend_peer["weights"]
