@@ -8,6 +8,7 @@ Parts C/D:
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import math
@@ -41,6 +42,19 @@ DEFAULT_FAMILY_REPS = [
     "f_118", "f_21", "f_107", "f_53", "f_50", "f_1",
     "f_35", "f_126", "f_31", "f_120", "f_117", "f_130",
 ]
+BRANCH_NAME_MAP = {
+    "A": "D7_et_base_control",
+    "F1": "D7_et_plus_family_factors",
+    "F2": "D7_et_plus_family_factors_interactions",
+    "F3": "D7_ridge_family_factors",
+}
+BRANCH_ORDER = [
+    "D7_et_base_control",
+    "D7_et_plus_family_factors",
+    "D7_et_plus_family_factors_interactions",
+    "D7_ridge_family_factors",
+]
+FAMILY_STANDARDIZATION_STATS: dict[str, tuple[float, float]] = {}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -952,6 +966,231 @@ def get_default_reps(existing_cols: list[str], n_reps: int = 12) -> list[str]:
     return reps[:n_reps]
 
 
+def parse_branch_selection(branches_arg: str | None) -> list[str]:
+    if not branches_arg or branches_arg.strip().lower() == "all":
+        return BRANCH_ORDER.copy()
+    tokens = [tok.strip() for tok in branches_arg.split(",") if tok.strip()]
+    selected: list[str] = []
+    for token in tokens:
+        key = token.upper()
+        branch = BRANCH_NAME_MAP.get(key, token)
+        if branch not in BRANCH_ORDER:
+            raise ValueError(f"Unknown branch token: {token}")
+        if branch not in selected:
+            selected.append(branch)
+    return selected
+
+
+def set_output_dir(path_str: str | None) -> Path:
+    global OUTPUT_DIR
+    OUTPUT_DIR = Path(path_str or "artifacts")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return OUTPUT_DIR
+
+
+def summary_row_to_result(summary_row: pd.Series) -> dict[str, object]:
+    fold_scores = [float(summary_row[f"fold_{i}"]) for i in range(N_SPLITS)]
+    return {
+        "model_name": str(summary_row["model_name"]),
+        "oof_corr": float(summary_row["oof_pearson"]),
+        "coverage_frac": float(summary_row["coverage_frac"]),
+        "fold_scores": fold_scores,
+        "recent_fold_mean": float(summary_row["recent_fold_mean"]),
+        "last_fold_score": float(summary_row["last_fold_score"]),
+        "n_features_mean": float(summary_row["n_features_mean"]),
+    }
+
+
+def build_feature_family_map(
+    df_train: pd.DataFrame,
+    anon_cols: list[str],
+    sparse_threshold: float = 0.20,
+    n_sparse_clusters: int = 6,
+    n_dense_clusters: int = 6,
+) -> dict[str, list[str]]:
+    from sklearn.cluster import AgglomerativeClustering
+
+    def _cluster_side(cols: list[str], prefix: str, max_clusters: int) -> dict[str, list[str]]:
+        if not cols:
+            return {}
+        cols = sorted(cols)
+        n_clusters = min(max_clusters, len(cols))
+        if len(cols) == 1:
+            return {f"{prefix}_family_01": cols}
+        value_corr = df_train[cols].corr().abs().fillna(0.0)
+        miss_corr = df_train[cols].isna().astype(np.float32).corr().abs().fillna(0.0)
+        sim = (0.7 * value_corr + 0.3 * miss_corr).clip(lower=0.0, upper=1.0)
+        np.fill_diagonal(sim.values, 1.0)
+        if n_clusters >= len(cols):
+            labels = np.arange(len(cols), dtype=int)
+        else:
+            dist = (1.0 - sim).to_numpy(np.float64)
+            dist = np.maximum(dist, 0.0)
+            labels = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                metric="precomputed",
+                linkage="average",
+            ).fit_predict(dist)
+        grouped: dict[int, list[str]] = {}
+        for col, label in zip(cols, labels):
+            grouped.setdefault(int(label), []).append(col)
+        ordered_groups = sorted(grouped.values(), key=lambda g: (g[0], len(g)))
+        return {
+            f"{prefix}_family_{i:02d}": sorted(group)
+            for i, group in enumerate(ordered_groups, start=1)
+        }
+
+    miss = df_train[anon_cols].isna().mean()
+    sparse_cols = sorted([c for c in anon_cols if float(miss.get(c, 0.0)) >= sparse_threshold])
+    dense_cols = sorted([c for c in anon_cols if float(miss.get(c, 0.0)) < sparse_threshold])
+    family_map = {}
+    family_map.update(_cluster_side(sparse_cols, "sparse", n_sparse_clusters))
+    family_map.update(_cluster_side(dense_cols, "dense", n_dense_clusters))
+    assigned = sorted([c for cols in family_map.values() for c in cols])
+    assert assigned == sorted(anon_cols), "Every anonymous feature must belong to exactly one family"
+    return family_map
+
+
+def set_family_standardization_stats(df_train: pd.DataFrame, anon_cols: list[str]) -> None:
+    global FAMILY_STANDARDIZATION_STATS
+    stats: dict[str, tuple[float, float]] = {}
+    for col in anon_cols:
+        arr = pd.to_numeric(df_train[col], errors="coerce").to_numpy(np.float64)
+        mu = float(np.nanmean(arr))
+        sd = float(np.nanstd(arr))
+        if not np.isfinite(mu):
+            mu = 0.0
+        if (not np.isfinite(sd)) or sd == 0:
+            sd = 1.0
+        stats[col] = (mu, sd)
+    FAMILY_STANDARDIZATION_STATS = stats
+
+
+def build_family_factor_block(
+    df: pd.DataFrame,
+    family_map: dict[str, list[str]],
+) -> tuple[pd.DataFrame, list[str]]:
+    out = df.copy()
+    family_factor_cols: list[str] = []
+    for family_name, raw_cols in family_map.items():
+        avail_raw = [c for c in raw_cols if c in out.columns]
+        if not avail_raw:
+            continue
+        raw_arr = out[avail_raw].to_numpy(np.float64)
+        finite = np.isfinite(raw_arr)
+        present_count = finite.sum(axis=1).astype(np.float32)
+        family_size = max(len(avail_raw), 1)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice.", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+            with np.errstate(invalid="ignore"):
+                value_mean = np.nanmean(raw_arr, axis=1)
+                value_std = np.nanstd(raw_arr, axis=1)
+                absmax = np.nanmax(np.abs(raw_arr), axis=1)
+        value_mean = np.where(np.isfinite(value_mean), value_mean, np.nan).astype(np.float32)
+        value_std = np.where(np.isfinite(value_std), value_std, np.nan).astype(np.float32)
+        absmax = np.where(np.isfinite(absmax), absmax, np.nan).astype(np.float32)
+
+        std_arr = raw_arr.copy()
+        for j, col in enumerate(avail_raw):
+            mu, sd = FAMILY_STANDARDIZATION_STATS.get(col, (0.0, 1.0))
+            std_arr[:, j] = (std_arr[:, j] - mu) / sd
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice.", category=RuntimeWarning)
+            with np.errstate(invalid="ignore"):
+                disagreement = np.nanstd(std_arr, axis=1)
+        disagreement = np.where(finite.sum(axis=1) >= 2, disagreement, np.nan).astype(np.float32)
+
+        block = {
+            f"fam_{family_name}_present_frac": (present_count / family_size).astype(np.float32),
+            f"fam_{family_name}_present_count": present_count,
+            f"fam_{family_name}_value_mean": value_mean,
+            f"fam_{family_name}_value_std": value_std,
+            f"fam_{family_name}_absmax": absmax,
+            f"fam_{family_name}_row_disagreement": disagreement,
+        }
+
+        rank_cols = [f"{c}_csrank" for c in avail_raw if f"{c}_csrank" in out.columns]
+        if rank_cols:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+                with np.errstate(invalid="ignore"):
+                    rank_mean = np.nanmean(out[rank_cols].to_numpy(np.float64), axis=1)
+            block[f"fam_{family_name}_rank_mean"] = np.where(np.isfinite(rank_mean), rank_mean, np.nan).astype(np.float32)
+
+        z_cols = [f"{c}_z" for c in avail_raw if f"{c}_z" in out.columns]
+        if z_cols:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+                with np.errstate(invalid="ignore"):
+                    z_mean = np.nanmean(out[z_cols].to_numpy(np.float64), axis=1)
+            block[f"fam_{family_name}_z_mean"] = np.where(np.isfinite(z_mean), z_mean, np.nan).astype(np.float32)
+
+        for name, values in block.items():
+            out[name] = values
+            family_factor_cols.append(name)
+    return out, family_factor_cols
+
+
+def build_family_factor_interactions(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    tr_idx: np.ndarray,
+    family_factor_cols: list[str],
+    top_k: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    y = df_train[TARGET_COL].to_numpy(np.float64)
+    cands: list[tuple[float, str, str, str]] = []
+    for i, a in enumerate(family_factor_cols):
+        if a not in df_train.columns:
+            continue
+        xa = pd.to_numeric(df_train[a], errors="coerce").to_numpy(np.float64)
+        for b in family_factor_cols[i + 1:]:
+            if b not in df_train.columns:
+                continue
+            xb = pd.to_numeric(df_train[b], errors="coerce").to_numpy(np.float64)
+            for kind in ("prod", "diff", "ratio"):
+                if kind == "prod":
+                    v = xa * xb
+                elif kind == "diff":
+                    v = xa - xb
+                else:
+                    v = xa / (1.0 + np.abs(xb))
+                m = np.isfinite(v[tr_idx]) & np.isfinite(y[tr_idx])
+                if int(m.sum()) < 100:
+                    continue
+                score = pearson(y[tr_idx][m], v[tr_idx][m])
+                if np.isfinite(score):
+                    cands.append((abs(score), a, b, kind))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    chosen = cands[:top_k]
+
+    tr = df_train.copy()
+    te = df_test.copy()
+    names: list[str] = []
+    for _, a, b, kind in chosen:
+        name = f"famix_{a}_{b}_{kind}"
+        xa_tr = pd.to_numeric(tr[a], errors="coerce").to_numpy(np.float64)
+        xb_tr = pd.to_numeric(tr[b], errors="coerce").to_numpy(np.float64)
+        xa_te = pd.to_numeric(te[a], errors="coerce").to_numpy(np.float64)
+        xb_te = pd.to_numeric(te[b], errors="coerce").to_numpy(np.float64)
+        if kind == "prod":
+            v_tr = xa_tr * xb_tr
+            v_te = xa_te * xb_te
+        elif kind == "diff":
+            v_tr = xa_tr - xb_tr
+            v_te = xa_te - xb_te
+        else:
+            v_tr = xa_tr / (1.0 + np.abs(xb_tr))
+            v_te = xa_te / (1.0 + np.abs(xb_te))
+        tr[name] = v_tr.astype(np.float32)
+        te[name] = v_te.astype(np.float32)
+        names.append(name)
+    return tr, te, names
+
+
 def build_group_relative_simple_features(
     df_ref: pd.DataFrame,
     df_apply: pd.DataFrame,
@@ -1174,6 +1413,58 @@ def save_oof_artifact(branch_name: str, y: np.ndarray, oof: np.ndarray, covered:
     }).to_csv(OUTPUT_DIR / f"oof_{branch_name}.csv", index=False)
 
 
+def save_test_pred_artifact(branch_name: str, test_ids: np.ndarray, test_pred: np.ndarray) -> None:
+    pd.DataFrame({
+        ID_COL: np.asarray(test_ids),
+        "raw_pred": np.asarray(test_pred, np.float64),
+    }).to_csv(OUTPUT_DIR / f"test_pred_{branch_name}.csv", index=False)
+
+
+def load_existing_branch_result(
+    source_dir: str | Path,
+    branch_name: str,
+    require_raw_test_pred: bool = False,
+) -> dict[str, object]:
+    source = Path(source_dir)
+    summary_path = source / "production_model_summary.csv"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Missing summary file: {summary_path}")
+    summary_df = pd.read_csv(summary_path)
+    row_df = summary_df[summary_df["model_name"] == branch_name]
+    if row_df.empty:
+        raise FileNotFoundError(f"Branch {branch_name} not found in {summary_path}")
+    result = summary_row_to_result(row_df.iloc[0])
+
+    oof_path = source / f"oof_{branch_name}.csv"
+    if not oof_path.exists():
+        raise FileNotFoundError(f"Missing OOF file: {oof_path}")
+    oof_df = pd.read_csv(oof_path)
+    result["oof_pred"] = oof_df["oof_pred"].to_numpy(np.float64)
+    result["target"] = oof_df["target"].to_numpy(np.float64)
+    result["covered"] = oof_df["oof_covered"].to_numpy(np.int8).astype(bool)
+
+    raw_test_path = source / f"test_pred_{branch_name}.csv"
+    if raw_test_path.exists():
+        raw_df = pd.read_csv(raw_test_path)
+        result["test_ids"] = raw_df[ID_COL].to_numpy()
+        result["test_pred"] = raw_df["raw_pred"].to_numpy(np.float64)
+    else:
+        sub_path = source / f"submission_{branch_name}.csv"
+        if not sub_path.exists() and branch_name == "D7_et_base_control":
+            sub_path = source / "submission_D7_et.csv"
+        if not sub_path.exists():
+            raise FileNotFoundError(f"Missing submission file for {branch_name} in {source}")
+        sub_df = pd.read_csv(sub_path)
+        result["test_ids"] = sub_df[ID_COL].to_numpy()
+        if require_raw_test_pred:
+            raise FileNotFoundError(
+                f"Missing raw test predictions for {branch_name}. "
+                f"Expected {raw_test_path} so unclipped export can be created exactly."
+            )
+        result["test_pred"] = sub_df[TARGET_COL].to_numpy(np.float64)
+    return result
+
+
 def run_et_ablation_branch(
     branch_name: str,
     df_train_base: pd.DataFrame,
@@ -1252,8 +1543,10 @@ def run_et_ablation_branch(
 
     oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
     save_oof_artifact(branch_name, y, oof, covered)
+    save_test_pred_artifact(branch_name, df_test_base[ID_COL].to_numpy(), test_pred)
     make_submission(df_test_base[ID_COL], test_pred, branch_name, clip=clip_submission)
     if save_legacy_d7_alias:
+        save_test_pred_artifact("D7_et", df_test_base[ID_COL].to_numpy(), test_pred)
         make_submission(df_test_base[ID_COL], test_pred, "D7_et", clip=clip_submission)
     return {
         "model_name": branch_name,
@@ -1277,10 +1570,177 @@ def duplicate_branch_with_new_submission(
     clip_submission: bool,
 ) -> dict[str, object]:
     save_oof_artifact(new_branch_name, np.asarray(source_result["target"]), np.asarray(source_result["oof_pred"]), np.asarray(source_result["covered"]))
+    save_test_pred_artifact(new_branch_name, np.asarray(source_result["test_ids"]), np.asarray(source_result["test_pred"]))
     make_submission(source_result["test_ids"], source_result["test_pred"], new_branch_name, clip=clip_submission)
     out = dict(source_result)
     out["model_name"] = new_branch_name
     return out
+
+
+def run_et_control_or_family_branch(
+    branch_name: str,
+    df_train_model: pd.DataFrame,
+    df_test_model: pd.DataFrame,
+    base_feat_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    meta_cols: list[str],
+    reps: list[str],
+    family_factor_cols: list[str] | None = None,
+) -> dict[str, object]:
+    from sklearn.ensemble import ExtraTreesRegressor
+
+    y = df_train_model[TARGET_COL].to_numpy(np.float64)
+    oof = np.zeros(len(df_train_model), dtype=np.float64)
+    covered = np.zeros(len(df_train_model), dtype=bool)
+    test_pred = np.zeros(len(df_test_model), dtype=np.float64)
+    fold_scores: list[float] = []
+    n_features: list[float] = []
+    family_interactions_by_fold: dict[str, list[str]] = {}
+
+    for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        tr_di = df_train_model.iloc[tr_idx][TIME_COL]
+        va_di = df_train_model.iloc[va_idx][TIME_COL]
+        assert tr_di.max() < va_di.min(), f"[{branch_name}] fold {fold_id}: walk-forward violated"
+
+        df_aug_tr, df_aug_te, base_ix_cols = build_fold_local_family_interactions(
+            df_train_model, df_test_model, tr_idx, va_idx, reps, top_k=TOP_FOLD_INTERACTIONS
+        )
+        feat_cols = [c for c in (base_feat_cols + base_ix_cols) if c in df_aug_tr.columns and c in df_aug_te.columns]
+
+        fam_ix_cols: list[str] = []
+        if branch_name == "D7_et_plus_family_factors_interactions":
+            df_aug_tr, df_aug_te, fam_ix_cols = build_family_factor_interactions(
+                df_aug_tr,
+                df_aug_te,
+                tr_idx,
+                family_factor_cols or [],
+                top_k=20,
+            )
+            feat_cols.extend([c for c in fam_ix_cols if c in df_aug_tr.columns and c in df_aug_te.columns])
+            family_interactions_by_fold[str(fold_id)] = fam_ix_cols
+
+        cat_cols = [c for c in meta_cols if c in feat_cols and c != TIME_COL]
+        num_cols = [
+            c for c in feat_cols
+            if c not in cat_cols and pd.api.types.is_numeric_dtype(df_aug_tr[c])
+        ]
+        Xtr = df_aug_tr.iloc[tr_idx][num_cols]
+        Xva = df_aug_tr.iloc[va_idx][num_cols]
+        Xte = df_aug_te[num_cols]
+        Xtr_imp, Xva_imp, Xte_imp = _fit_numeric_preprocessor(Xtr, Xva, Xte, standardize=False)
+        n_features.append(float(len(num_cols)))
+
+        fold_pred_sum = np.zeros(len(va_idx), dtype=np.float64)
+        fold_test_sum = np.zeros(len(df_test_model), dtype=np.float64)
+        for seed, max_features, min_leaf in ET_SETTINGS:
+            model = ExtraTreesRegressor(
+                n_estimators=1200,
+                min_samples_leaf=min_leaf,
+                bootstrap=True,
+                max_features=max_features,
+                random_state=seed + fold_id,
+                n_jobs=-1,
+            )
+            model.fit(Xtr_imp, y[tr_idx])
+            fold_pred_sum += model.predict(Xva_imp)
+            fold_test_sum += model.predict(Xte_imp)
+            del model
+            gc.collect()
+
+        fold_pred = fold_pred_sum / len(ET_SETTINGS)
+        fold_test = fold_test_sum / len(ET_SETTINGS)
+        oof[va_idx] = fold_pred
+        covered[va_idx] = True
+        test_pred += fold_test / len(splits)
+        fc = pearson(y[va_idx], fold_pred)
+        fold_scores.append(fc)
+        print(
+            f"  [{branch_name}] fold {fold_id}: Pearson={fc:.6f}  "
+            f"n_features={len(num_cols)}  base_ix={len(base_ix_cols)}  fam_ix={len(fam_ix_cols)}"
+        )
+
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
+    save_oof_artifact(branch_name, y, oof, covered)
+    save_test_pred_artifact(branch_name, df_test_model[ID_COL].to_numpy(), test_pred)
+    make_submission(df_test_model[ID_COL], test_pred, branch_name, clip=True)
+    if branch_name == "D7_et_base_control":
+        save_test_pred_artifact("D7_et", df_test_model[ID_COL].to_numpy(), test_pred)
+        make_submission(df_test_model[ID_COL], test_pred, "D7_et", clip=True)
+    if family_interactions_by_fold:
+        (OUTPUT_DIR / "family_factor_interactions_by_fold.json").write_text(
+            json.dumps(family_interactions_by_fold, indent=2)
+        )
+    return {
+        "model_name": branch_name,
+        "oof_pred": oof,
+        "test_pred": test_pred,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test_model[ID_COL].to_numpy(),
+        "fold_scores": fold_scores,
+        "recent_fold_mean": float(np.nanmean(fold_scores[3:5])),
+        "last_fold_score": float(fold_scores[4]),
+        "n_features_mean": float(np.mean(n_features)) if n_features else float("nan"),
+    }
+
+
+def run_ridge_family_factors(
+    df_train_model: pd.DataFrame,
+    df_test_model: pd.DataFrame,
+    family_factor_cols: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+) -> dict[str, object]:
+    from sklearn.linear_model import RidgeCV
+
+    y = df_train_model[TARGET_COL].to_numpy(np.float64)
+    oof = np.zeros(len(df_train_model), dtype=np.float64)
+    covered = np.zeros(len(df_train_model), dtype=bool)
+    test_pred = np.zeros(len(df_test_model), dtype=np.float64)
+    fold_scores: list[float] = []
+    n_features: list[float] = []
+
+    feat_cols = [c for c in family_factor_cols if c in df_train_model.columns and c in df_test_model.columns]
+    for fold_id, (tr_idx, va_idx) in enumerate(splits):
+        tr_di = df_train_model.iloc[tr_idx][TIME_COL]
+        va_di = df_train_model.iloc[va_idx][TIME_COL]
+        assert tr_di.max() < va_di.min(), f"[D7_ridge_family_factors] fold {fold_id}: walk-forward violated"
+
+        Xtr = df_train_model.iloc[tr_idx][feat_cols]
+        Xva = df_train_model.iloc[va_idx][feat_cols]
+        Xte = df_test_model[feat_cols]
+        Xtr_imp, Xva_imp, Xte_imp = _fit_numeric_preprocessor(Xtr, Xva, Xte, standardize=True)
+        n_features.append(float(len(feat_cols)))
+        model = RidgeCV(alphas=np.logspace(-3, 3, 13))
+        model.fit(Xtr_imp, y[tr_idx])
+        p_va = model.predict(Xva_imp)
+        p_te = model.predict(Xte_imp)
+        oof[va_idx] = p_va
+        covered[va_idx] = True
+        test_pred += p_te / len(splits)
+        fc = pearson(y[va_idx], p_va)
+        fold_scores.append(fc)
+        print(f"  [D7_ridge_family_factors] fold {fold_id}: Pearson={fc:.6f}  n_features={len(feat_cols)}")
+
+    oof_score, cov_frac = oof_pearson_on_covered(y, oof, covered)
+    save_oof_artifact("D7_ridge_family_factors", y, oof, covered)
+    save_test_pred_artifact("D7_ridge_family_factors", df_test_model[ID_COL].to_numpy(), test_pred)
+    make_submission(df_test_model[ID_COL], test_pred, "D7_ridge_family_factors", clip=True)
+    return {
+        "model_name": "D7_ridge_family_factors",
+        "oof_pred": oof,
+        "test_pred": test_pred,
+        "oof_corr": oof_score,
+        "coverage_frac": cov_frac,
+        "covered": covered,
+        "target": y,
+        "test_ids": df_test_model[ID_COL].to_numpy(),
+        "fold_scores": fold_scores,
+        "recent_fold_mean": float(np.nanmean(fold_scores[3:5])),
+        "last_fold_score": float(fold_scores[4]),
+        "n_features_mean": float(np.mean(n_features)) if n_features else float("nan"),
+    }
 
 
 def build_production_model_summary(model_results: list[dict[str, object]]) -> pd.DataFrame:
@@ -1317,6 +1777,94 @@ def build_production_model_summary(model_results: list[dict[str, object]]) -> pd
     )
     df.to_csv(OUTPUT_DIR / "production_model_summary.csv", index=False)
     return df
+
+
+def finalize_ablation_report(model_results: list[dict[str, object]]) -> list[str]:
+    if not model_results:
+        raise ValueError("No model results available to summarize.")
+    by_name = {str(res["model_name"]): res for res in model_results}
+    if "D7_et_base_control" not in by_name:
+        raise ValueError("Control branch result is required for summary and deltas.")
+
+    df_results = build_production_model_summary(model_results)
+    control = by_name["D7_et_base_control"]
+    control_oof = float(control["oof_corr"])
+    control_recent = float(control["recent_fold_mean"])
+    control_fold4 = float(control["fold_scores"][4])
+
+    delta_rows = []
+    for name in BRANCH_ORDER[1:]:
+        if name not in by_name:
+            continue
+        res = by_name[name]
+        delta_oof = float(res["oof_corr"]) - control_oof
+        delta_recent = float(res["recent_fold_mean"]) - control_recent
+        delta_features = float(res["n_features_mean"]) - float(control["n_features_mean"])
+        unstable = (
+            name != "D7_et_base_control"
+            and float(res["fold_scores"][4]) > control_fold4
+            and float(res["recent_fold_mean"]) <= control_recent
+        )
+        serious_challenger = delta_oof >= 0.002 and not unstable
+        delta_rows.append({
+            "model_name": name,
+            "delta_vs_control_oof": delta_oof,
+            "delta_vs_control_recent": delta_recent,
+            "delta_vs_control_n_features": delta_features,
+            "unstable_fold4_only": unstable,
+            "serious_challenger": serious_challenger,
+        })
+    df_delta = pd.DataFrame(delta_rows)
+
+    ranked_names = [name for name in df_results["model_name"].tolist() if name in by_name]
+    challengers = []
+    if not df_delta.empty:
+        challengers = df_delta[df_delta["serious_challenger"]]["model_name"].tolist()
+    recommended_order = ["D7_et_base_control"]
+    recommended_order.extend([name for name in ranked_names if name in challengers and name not in recommended_order])
+
+    summary = {
+        "production_candidates": [str(r["model_name"]) for r in model_results],
+        "recommended_submit_order": recommended_order,
+    }
+    (OUTPUT_DIR / "advanced_summary.json").write_text(json.dumps(summary, indent=2))
+
+    print("\n" + "=" * 60)
+    print("PRODUCTION MODEL SUMMARY (sorted by recent folds, then OOF)")
+    print("=" * 60)
+    print(df_results.to_string(index=False))
+
+    print("\n" + "=" * 60)
+    print("DELTA VS D7_et_base_control")
+    print("=" * 60)
+    if df_delta.empty:
+        print("No challenger rows available.")
+    else:
+        print(df_delta.to_string(index=False))
+
+    print("\n" + "=" * 60)
+    print("FEATURE COUNT DIFFERENCES")
+    print("=" * 60)
+    if df_delta.empty:
+        print("No challenger rows available.")
+    else:
+        print(
+            df_delta[["model_name", "delta_vs_control_n_features"]]
+            .sort_values("delta_vs_control_n_features", ascending=False)
+            .to_string(index=False)
+        )
+
+    print("\n" + "=" * 60)
+    print("FINAL RECOMMENDED SUBMIT ORDER")
+    print("=" * 60)
+    for i, name in enumerate(recommended_order, start=1):
+        print(f"  {i}. {name}")
+
+    if "D7_ridge_family_factors" in by_name and float(by_name["D7_ridge_family_factors"]["oof_corr"]) > control_oof:
+        print("\nRidge family-factor baseline beat control on OOF. That is important signal.")
+
+    print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
+    return recommended_order
 
 
 def run_mlp_d7(
@@ -1548,6 +2096,12 @@ def make_submission(test_ids, preds, name, clip: bool = True):
 
 # ── main ───────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="Run ET control and family-factor research branches.")
+    parser.add_argument("--output-dir", default="artifacts", help="Directory to write outputs into")
+    args = parser.parse_args()
+    set_output_dir(args.output_dir)
+    print(f"Output dir: {OUTPUT_DIR.resolve()}")
+
     print("Loading data...")
     df_train = pd.read_csv(TRAIN_PATH)
     df_test  = pd.read_csv(TEST_PATH)
@@ -1571,7 +2125,6 @@ def main():
     print("Building fixed D7 representation")
     print("="*60)
     base_cols = meta_cols + anon_cols
-    df_train_ctx, df_test_ctx = add_forward_safe_si_context(df_train, df_test)
 
     df_train_rank = add_rank_features(df_train, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
     df_test_rank = add_rank_features(df_test, anon_numeric_cols, group_col=TIME_COL, suffix="_csrank")
@@ -1604,145 +2157,69 @@ def main():
     d7_base_feat_cols = base_cols + rank_cols + z_cols + sparse_derived
     print(f"  D7 base feature count before fold-local interactions: {len(d7_base_feat_cols)}")
 
+    print("\n" + "=" * 60)
+    print("Discovering latent anonymous-feature families")
+    print("=" * 60)
+    family_map = build_feature_family_map(df_train, anon_cols)
+    (OUTPUT_DIR / "family_map.json").write_text(json.dumps(family_map, indent=2))
+    set_family_standardization_stats(df_train, anon_cols)
+    df_train_family, family_factor_cols = build_family_factor_block(df_train_d6, family_map)
+    df_test_family, test_family_factor_cols = build_family_factor_block(df_test_d6, family_map)
+    assert family_factor_cols == test_family_factor_cols, "Family factor columns must match between train and test"
+    (OUTPUT_DIR / "family_factor_columns.json").write_text(json.dumps(family_factor_cols, indent=2))
+    print(f"  discovered families: {len(family_map)}")
+    print(f"  family factor columns: {len(family_factor_cols)}")
+
     print("\n" + "="*60)
-    print("Five-way ET ablation ladder")
+    print("Running control and family-factor branches")
     print("="*60)
-    control = run_et_ablation_branch(
+    control_result = run_et_control_or_family_branch(
         "D7_et_base_control",
         df_train_d6,
         df_test_d6,
-        df_train_ctx,
-        df_test_ctx,
         d7_base_feat_cols,
         splits,
         meta_cols,
-        anon_cols,
-        sparse_cols,
-        clip_submission=True,
-        save_legacy_d7_alias=True,
+        reps,
+        family_factor_cols=None,
     )
-    noclip = duplicate_branch_with_new_submission(control, "D7_et_base_noclip", clip_submission=False)
-    plus_context = run_et_ablation_branch(
-        "D7_et_base_plus_context",
-        df_train_d6,
-        df_test_d6,
-        df_train_ctx,
-        df_test_ctx,
-        d7_base_feat_cols,
+    f1_result = run_et_control_or_family_branch(
+        "D7_et_plus_family_factors",
+        df_train_family,
+        df_test_family,
+        d7_base_feat_cols + family_factor_cols,
         splits,
         meta_cols,
-        anon_cols,
-        sparse_cols,
-        clip_submission=True,
+        reps,
+        family_factor_cols=family_factor_cols,
     )
-    more_interactions = run_et_ablation_branch(
-        "D7_et_base_plus_more_interactions",
-        df_train_d6,
-        df_test_d6,
-        df_train_ctx,
-        df_test_ctx,
-        d7_base_feat_cols,
+    f2_result = run_et_control_or_family_branch(
+        "D7_et_plus_family_factors_interactions",
+        df_train_family,
+        df_test_family,
+        d7_base_feat_cols + family_factor_cols,
         splits,
         meta_cols,
-        anon_cols,
-        sparse_cols,
-        clip_submission=True,
+        reps,
+        family_factor_cols=family_factor_cols,
     )
-    small_peer = run_et_ablation_branch(
-        "D7_et_base_plus_small_peer",
-        df_train_d6,
-        df_test_d6,
-        df_train_ctx,
-        df_test_ctx,
-        d7_base_feat_cols,
+    f3_result = run_ridge_family_factors(
+        df_train_family,
+        df_test_family,
+        family_factor_cols,
         splits,
-        meta_cols,
-        anon_cols,
-        sparse_cols,
-        clip_submission=True,
     )
+    results = [control_result, f1_result, f2_result, f3_result]
 
-    results = [control, noclip, plus_context, more_interactions, small_peer]
-    df_results = build_production_model_summary(results)
-
-    control_oof = float(control["oof_corr"])
-    control_recent = float(control["recent_fold_mean"])
-    control_fold4 = float(control["fold_scores"][4])
-    delta_rows = []
-    for res in results:
-        name = str(res["model_name"])
-        delta_oof = float(res["oof_corr"]) - control_oof
-        delta_recent = float(res["recent_fold_mean"]) - control_recent
-        delta_features = float(res["n_features_mean"]) - float(control["n_features_mean"])
-        unstable = (
-            name != "D7_et_base_control"
-            and float(res["fold_scores"][4]) > control_fold4
-            and float(res["recent_fold_mean"]) <= control_recent
-        )
-        promote = name == "D7_et_base_control" or name == "D7_et_base_noclip" or (delta_oof >= 0.002 and not unstable)
-        delta_rows.append({
-            "model_name": name,
-            "delta_vs_control_oof": delta_oof,
-            "delta_vs_control_recent": delta_recent,
-            "delta_vs_control_n_features": delta_features,
-            "unstable_fold4_only": unstable,
-            "promote": promote,
-        })
-    df_delta = pd.DataFrame(delta_rows)
-
-    promoted = df_delta[df_delta["promote"]]["model_name"].tolist()
-    if "D7_et_base_control" in promoted:
-        promoted.remove("D7_et_base_control")
-    if "D7_et_base_noclip" in promoted:
-        promoted.remove("D7_et_base_noclip")
-    ranked_names = df_results["model_name"].tolist()
-    recommended_order = ["D7_et_base_control", "D7_et_base_noclip"]
-    recommended_order.extend([name for name in ranked_names if name in promoted and name not in recommended_order])
-
-    summary = {
-        "production_candidates": [str(r["model_name"]) for r in results],
-        "d7_base_feature_count": len(d7_base_feat_cols),
-        "rank_feature_count": len(rank_cols),
-        "z_feature_count": len(z_cols),
-        "sparse_feature_count": len(sparse_derived),
-        "et_grid": {
-            "seeds": [42, 52, 62],
-            "max_features": [0.10, 0.20, 0.35],
-            "min_samples_leaf": [10, 20],
-            "n_estimators": 1200,
-            "bootstrap": True,
-            "n_jobs": -1,
-        },
-        "recommended_submit_order": recommended_order,
-    }
-    (OUTPUT_DIR / "advanced_summary.json").write_text(json.dumps(summary, indent=2))
-
-    print("\n" + "="*60)
-    print("PRODUCTION MODEL SUMMARY (sorted by recent folds, then OOF)")
-    print("="*60)
-    print(df_results.to_string(index=False))
-
-    print("\n" + "="*60)
-    print("DELTA VS D7_et_base_control")
-    print("="*60)
-    print(df_delta.to_string(index=False))
-
-    print("\n" + "="*60)
-    print("FEATURE COUNT DIFFERENCES")
-    print("="*60)
-    print(
-        df_delta[["model_name", "delta_vs_control_n_features"]]
-        .sort_values("delta_vs_control_n_features", ascending=False)
-        .to_string(index=False)
+    best_et = max(
+        [control_result, f1_result, f2_result],
+        key=lambda res: (float(res["recent_fold_mean"]), float(res["oof_corr"]))
     )
+    make_submission(best_et["test_ids"], best_et["test_pred"], f"{best_et['model_name']}_noclip", clip=False)
+    make_submission(best_et["test_ids"], best_et["test_pred"], str(best_et["model_name"]), clip=True)
 
-    print("\n" + "="*60)
-    print("FINAL RECOMMENDED SUBMIT ORDER")
-    print("="*60)
-    for i, name in enumerate(recommended_order, start=1):
-        print(f"  {i}. {name}")
-
-    print(f"\nAll outputs in: {OUTPUT_DIR.resolve()}")
+    ordered_results = [res for name in BRANCH_ORDER for res in results if str(res["model_name"]) == name]
+    finalize_ablation_report(ordered_results)
 
 
 if __name__ == "__main__":
